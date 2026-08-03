@@ -1,0 +1,32 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DEMO_MODE: "true"
+      SAMPLE_INTERVAL_MINUTES: "5"
+      DATABASE_URL: "sqlite+aiosqlite:///./data/tone.db"
+      CHROMA_PATH: "./data/chroma"
+      LLM_BASE_URL: "${LLM_BASE_URL:-http://host.docker.internal:11434/v1}"
+      LLM_API_KEY: "${LLM_API_KEY:-ollama}"
+      LLM_MODEL: "${LLM_MODEL:-llama3.2}"
+      SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL:-}"
+      DRIFT_THRESHOLD: "0.40"
+    volumes:
+      - tone-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ""
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  tone-data:
