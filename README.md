@@ -69,46 +69,37 @@ Open http://localhost:5173
 4. Watch overall drift, category heatmap, and baseline-vs-current panel spike.
 5. Optional: set `SLACK_WEBHOOK_URL` to receive alerts when scores cross threshold.
 
-## Database (PostgreSQL)
+## Database
 
-Tone stores per-user accounts, LLM connections (encrypted API keys), probe samples, drift scores, and alerts in a SQL database. **PostgreSQL** is the production target; SQLite still works for quick local demos.
+Tone stores per-user accounts, LLM connections (encrypted API keys), probe samples, drift scores, and alerts in a SQL database. **PostgreSQL** is the production target; SQLite works for quick local demos and first Railway deploys (with a volume on `/app/data`).
 
-### What was set up on this machine
-- PostgreSQL 17 is installed and the Windows service `postgresql-x64-17` is running
-- App code + Docker Compose are wired for Postgres
-- Tables are created automatically on API startup (`init_db`) or via `python -m scripts.init_db`
-
-### Finish creating the Tone database
-
-During install, PostgreSQL asked for a **postgres** superuser password. Use that once:
+### Local PostgreSQL
 
 ```powershell
-cd c:\projects\Tone\backend
+cd backend
 $env:PGPASSWORD = "YOUR_POSTGRES_PASSWORD_HERE"
 .\scripts\setup_postgres.ps1
 ```
 
-Then set in `backend/.env`:
+Set in `backend/.env`:
 
 ```env
 DATABASE_URL=postgresql+asyncpg://tone:tone@127.0.0.1:5432/tone
 ```
 
-Restart the API. Confirm with:
+Or with Docker: `docker compose up -d db` (same URL against `127.0.0.1:5432`).
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/api/health
-```
+Tables are created on API startup or via `python -m scripts.init_db`. Confirm: `GET /api/health` should show `"dialect": "postgresql"`.
 
-You should see `"dialect": "postgresql"`.
+## Deploy on Railway
 
-### Docker alternative (when Docker Desktop is installed)
+1. Push this repo to GitHub and create a Railway project from it.
+2. **Backend service** — Root Directory `backend`, Dockerfile builder. Attach a volume at `/app/data`.
+3. Set backend env: `SECRET_KEY`, `DEMO_MODE=false`, `DATABASE_URL=sqlite+aiosqlite:///./data/tone.db`, `FRONTEND_URL`, Google OAuth vars if used.
+4. **Frontend service** — Root Directory `frontend`. Build arg `VITE_API_URL=https://<backend-public-url>`.
+5. In Google Cloud Console, add the production redirect URI: `https://<backend>/api/auth/google/callback`.
 
-```bash
-docker compose up -d db
-```
-
-Default URL: `postgresql+asyncpg://tone:tone@127.0.0.1:5432/tone`
+Customers must connect a **public** OpenAI-compatible LLM endpoint (OpenAI, OpenRouter, hosted vLLM). Local Ollama (`localhost`) only works when Tone itself is running on the same machine.
 
 ## Auth + per-user isolation
 

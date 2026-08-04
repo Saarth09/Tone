@@ -1,0 +1,11 @@
+# Tone monorepo on Railway: create two services from this repo.
+# - Backend: set Root Directory to `backend`
+# - Frontend: set Root Directory to `frontend`, and build arg
+#   VITE_API_URL=https://<your-backend-public-url>
+#
+# Attach a volume to the backend service at mount path `/app/data`
+# so SQLite + Chroma persist across deploys.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "backend/Dockerfile"
