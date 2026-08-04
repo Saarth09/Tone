@@ -54,6 +54,10 @@ class StatusOut(BaseModel):
     live_samples: int
     latest_overall_score: Optional[float] = None
     drifted: Optional[bool] = None
+    system_prompt_poisoned: bool = False
+    llm_connected: bool = False
+    llm_connection_name: Optional[str] = None
+    llm_provider: Optional[str] = None
 
 
 class BaselineRequest(BaseModel):
@@ -93,3 +97,72 @@ class AlertOut(BaseModel):
 
 class DriftSimulateRequest(BaseModel):
     enable: bool = True
+
+
+class SystemPromptRequest(BaseModel):
+    system_prompt: str = ""
+
+
+class LLMConnectionIn(BaseModel):
+    name: str = "Production LLM"
+    provider: str = Field(default="custom", description="openai|ollama|openrouter|custom")
+    base_url: str
+    api_key: str = ""
+    model: str
+    system_prompt: str = ""
+    keep_existing_key: bool = False
+
+
+class LLMConnectionOut(BaseModel):
+    id: Optional[int] = None
+    name: str
+    provider: str
+    base_url: str
+    model: str
+    system_prompt: str = ""
+    api_key_masked: str = ""
+    has_api_key: bool = False
+    is_active: bool = False
+    connected: bool = False
+    last_tested_at: Optional[datetime] = None
+    last_test_ok: Optional[bool] = None
+    last_test_message: Optional[str] = None
+
+
+class LLMConnectionTestIn(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model: str
+    keep_existing_key: bool = False
+
+
+class LLMConnectionTestOut(BaseModel):
+    ok: bool
+    message: str
+    latency_ms: float = 0.0
+
+
+class RegisterIn(BaseModel):
+    email: str
+    password: str = Field(min_length=8)
+    name: str = ""
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+    name: str
+    avatar_url: Optional[str] = None
+    auth_provider: str = "password"
+
+    model_config = {"from_attributes": True}

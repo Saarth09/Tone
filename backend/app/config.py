@@ -41,6 +41,19 @@ class Settings(BaseSettings):
     # Demo mode generates synthetic drift without a live LLM
     demo_mode: bool = False
 
+    # Optional system prompt override (used to simulate pipeline poisoning on a real LLM)
+    llm_system_prompt: str = ""
+
+    # Auth
+    secret_key: str = "tone-dev-change-me-in-production"
+    jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
+    access_token_cookie: str = "tone_token"
+
+    # Google OAuth (optional — enable Login with Google)
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/api/auth/google/callback"
+    frontend_url: str = "http://127.0.0.1:5173"
 
 @lru_cache
 def get_settings() -> Settings:

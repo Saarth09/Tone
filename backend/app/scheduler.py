@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from sqlalchemy import select
 
-from app.config import get_settings
-from app.db import SessionLocal
 from app.alerting import Alerter
+from app.config import get_settings
+from app.connections import ConnectionStore
+from app.db import SessionLocal
+from app.db.models import LLMConnection, Sample
 from app.detector import DriftDetector
 from app.embedder import Embedder
 from app.sampler import Sampler
@@ -24,12 +27,14 @@ class JobRunner:
         embedder: Embedder,
         detector: DriftDetector,
         alerter: Alerter,
+        connections: ConnectionStore,
     ) -> None:
         self.settings = get_settings()
         self.sampler = sampler
         self.embedder = embedder
         self.detector = detector
         self.alerter = alerter
+        self.connections = connections
         self.scheduler = AsyncIOScheduler()
         self._lock = asyncio.Lock()
 
@@ -41,7 +46,7 @@ class JobRunner:
             minutes=minutes,
             id="sample_cycle",
             replace_existing=True,
-            next_run_time=None,  # wait for first interval unless triggered
+            next_run_time=None,
         )
         self.scheduler.start()
         logger.info("Scheduler started — sampling every %s minutes", minutes)
@@ -51,43 +56,64 @@ class JobRunner:
 
     async def scheduled_cycle(self) -> None:
         async with SessionLocal() as session:
-            if not await self.sampler.is_baseline_ready(session):
-                logger.info("Skipping scheduled cycle — baseline not ready")
-                return
-            await self.run_sample_and_detect(session)
+            result = await session.execute(
+                select(LLMConnection.user_id).where(LLMConnection.is_active.is_(True)).distinct()
+            )
+            user_ids = [row[0] for row in result.all()]
+            for user_id in user_ids:
+                try:
+                    if not await self.sampler.is_baseline_ready(session, user_id):
+                        continue
+                    await self.connections.load_user(session, user_id)
+                    await self.run_sample_and_detect(session, user_id=user_id)
+                except Exception:
+                    logger.exception("Scheduled cycle failed for user %s", user_id)
 
-    async def embed_samples(self, samples) -> None:
+    async def embed_samples(self, samples: list[Sample]) -> None:
         for sample in samples:
             created = sample.created_at or datetime.now(timezone.utc)
             self.embedder.store(
                 sample.id,
                 sample.response,
+                user_id=sample.user_id,
                 probe_id=sample.probe_id,
                 category=sample.category,
                 is_baseline=sample.is_baseline,
                 created_at=created.isoformat(),
             )
 
-    async def run_baseline(self, session, runs: Optional[int] = None) -> int:
+    async def run_baseline(
+        self, session, *, user_id: int, runs: Optional[int] = None
+    ) -> int:
         async with self._lock:
-            samples_total = await self.sampler.establish_baseline(session, runs=runs)
-            # Re-fetch baseline samples to embed (establish_baseline already committed)
-            from sqlalchemy import select
-            from app.db.models import Sample
-
+            await self.connections.load_user(session, user_id)
+            samples_total = await self.sampler.establish_baseline(
+                session, user_id=user_id, runs=runs
+            )
             result = await session.execute(
-                select(Sample).where(Sample.is_baseline.is_(True))
+                select(Sample).where(
+                    Sample.user_id == user_id, Sample.is_baseline.is_(True)
+                )
             )
             samples = list(result.scalars().all())
             await self.embed_samples(samples)
             return samples_total
 
-    async def run_sample_and_detect(self, session, probe_ids: Optional[list[str]] = None) -> dict:
+    async def run_sample_and_detect(
+        self,
+        session,
+        *,
+        user_id: int,
+        probe_ids: Optional[list[str]] = None,
+    ) -> dict:
         async with self._lock:
-            samples = await self.sampler.run_cycle(session, is_baseline=False, probe_ids=probe_ids)
+            await self.connections.load_user(session, user_id)
+            samples = await self.sampler.run_cycle(
+                session, user_id=user_id, is_baseline=False, probe_ids=probe_ids
+            )
             await self.embed_samples(samples)
-            drift_results = await self.detector.evaluate_all(session)
+            drift_results = await self.detector.evaluate_all(session, user_id=user_id)
             for r in drift_results:
                 if r.is_alert:
-                    await self.alerter.maybe_alert(session, r)
+                    await self.alerter.maybe_alert(session, user_id=user_id, result=r)
             return {"samples": samples, "drift": drift_results}

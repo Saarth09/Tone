@@ -18,20 +18,28 @@ class Alerter:
     def __init__(self) -> None:
         self.settings = get_settings()
 
-    async def _recently_alerted(self, session: AsyncSession, category: str) -> bool:
+    async def _recently_alerted(
+        self, session: AsyncSession, *, user_id: int, category: str
+    ) -> bool:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.settings.alert_cooldown_minutes)
         q = (
             select(AlertEvent)
-            .where(AlertEvent.category == category, AlertEvent.created_at >= cutoff)
+            .where(
+                AlertEvent.user_id == user_id,
+                AlertEvent.category == category,
+                AlertEvent.created_at >= cutoff,
+            )
             .limit(1)
         )
         result = await session.execute(q)
         return result.scalar_one_or_none() is not None
 
-    async def maybe_alert(self, session: AsyncSession, result: CategoryDriftResult) -> AlertEvent | None:
+    async def maybe_alert(
+        self, session: AsyncSession, *, user_id: int, result: CategoryDriftResult
+    ) -> AlertEvent | None:
         if not result.is_alert:
             return None
-        if await self._recently_alerted(session, result.category):
+        if await self._recently_alerted(session, user_id=user_id, category=result.category):
             return None
 
         message = (
@@ -41,6 +49,7 @@ class Alerter:
         )
         delivered = await self._send_slack(message)
         event = AlertEvent(
+            user_id=user_id,
             category=result.category,
             score=result.combined_score,
             threshold=result.threshold,

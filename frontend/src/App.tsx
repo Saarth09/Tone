@@ -16,10 +16,16 @@ import {
   Compare,
   DriftScore,
   Explainability,
+  getToken,
   HeatmapCell,
   Probe,
+  setToken,
   Status,
+  User,
 } from "./api";
+import AuthScreen from "./AuthScreen";
+import AccountMenu from "./AccountMenu";
+import ConnectLLM from "./ConnectLLM";
 
 function fmtTime(iso: string) {
   const d = new Date(iso);
@@ -35,6 +41,17 @@ function heatColor(score: number) {
 }
 
 export default function App() {
+  const [authed, setAuthed] = useState<boolean>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("token");
+    if (token) {
+      setToken(token);
+      window.history.replaceState({}, "", window.location.pathname);
+      return true;
+    }
+    return Boolean(getToken());
+  });
+  const [user, setUser] = useState<User | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
   const [driftHistory, setDriftHistory] = useState<DriftScore[]>([]);
   const [latest, setLatest] = useState<Record<string, DriftScore>>({});
@@ -48,8 +65,13 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    if (!getToken()) {
+      setAuthed(false);
+      return;
+    }
     try {
-      const [s, d, l, h, p, e, a] = await Promise.all([
+      const [me, s, d, l, h, p, e, a] = await Promise.all([
+        api.me(),
         api.status(),
         api.drift("overall"),
         api.latest(),
@@ -58,6 +80,7 @@ export default function App() {
         api.explain(),
         api.alerts(),
       ]);
+      setUser(me);
       setStatus(s);
       setDriftHistory([...d].reverse());
       setLatest(l);
@@ -66,21 +89,27 @@ export default function App() {
       setExplain(e);
       setAlerts(a);
       setError(null);
+      setAuthed(true);
     } catch (err) {
+      if (!getToken()) {
+        setAuthed(false);
+        return;
+      }
       setError(err instanceof Error ? err.message : "Failed to load");
     }
   }, []);
 
   useEffect(() => {
+    if (!authed) return;
     refresh();
     const id = setInterval(refresh, 8000);
     return () => clearInterval(id);
-  }, [refresh]);
+  }, [refresh, authed]);
 
   useEffect(() => {
-    if (!selectedProbe) return;
+    if (!authed || !selectedProbe) return;
     api.compare(selectedProbe).then(setCompare).catch(() => setCompare(null));
-  }, [selectedProbe, driftHistory.length]);
+  }, [selectedProbe, driftHistory.length, authed]);
 
   const chartData = useMemo(
     () =>
@@ -122,8 +151,20 @@ export default function App() {
     }));
   }, [heatmap]);
 
+  if (!authed) {
+    return <AuthScreen onAuthed={() => setAuthed(true)} />;
+  }
+
   return (
     <div className="app">
+      <AccountMenu
+        user={user}
+        onLogout={() => {
+          api.logout();
+          setAuthed(false);
+          setUser(null);
+        }}
+      />
       <header className="hero">
         <h1 className="brand">
           Tone<span>.</span>
@@ -133,36 +174,49 @@ export default function App() {
           embedding-space MMD, token KL divergence, and persona cosine checks.
         </p>
         <div className="toolbar">
-          <span className={`pill ${alertActive ? "danger" : status?.drifted ? "warn" : ""}`}>
+          <span className={`pill ${alertActive ? "danger" : status?.drifted || status?.system_prompt_poisoned ? "warn" : ""}`}>
             <span className="dot" />
             {alertActive
               ? "Drift alert"
               : status?.drifted
                 ? "Injected persona active"
-                : "Monitoring"}
+                : status?.system_prompt_poisoned
+                  ? "System prompt poisoned"
+                  : "Monitoring"}
           </span>
+          {user && <span className="pill">{user.email}</span>}
           <span className="pill">
-            {status?.demo_mode ? "Demo mode" : status?.llm_model || "…"}
+            {status?.demo_mode
+              ? "Demo mode"
+              : status?.llm_connected
+                ? status.llm_model
+                : status?.llm_model || "…"}
           </span>
+          {status?.llm_connected && (
+            <span className="pill">Connected · {status.llm_provider}</span>
+          )}
           <span className="pill">
             every {status?.sample_interval_minutes ?? "—"} min
           </span>
           <button
             className="btn primary"
-            disabled={busy}
+            disabled={busy || !status?.baseline_ready}
+            title={
+              status?.baseline_ready
+                ? undefined
+                : "Establish a baseline before running live sample cycles"
+            }
             onClick={() => runAction(() => api.sample())}
           >
             Run sample cycle
           </button>
-          {!status?.baseline_ready && (
-            <button
-              className="btn"
-              disabled={busy}
-              onClick={() => runAction(() => api.baseline())}
-            >
-              Establish baseline
-            </button>
-          )}
+          <button
+            className="btn"
+            disabled={busy}
+            onClick={() => runAction(() => api.baseline())}
+          >
+            {status?.baseline_ready ? "Rebuild baseline" : "Establish baseline"}
+          </button>
           {status?.demo_mode && (
             <>
               <button
@@ -186,16 +240,44 @@ export default function App() {
               </button>
             </>
           )}
+          {status && !status.demo_mode && (
+            <>
+              <button
+                className="btn danger"
+                disabled={busy || Boolean(status.system_prompt_poisoned)}
+                onClick={() =>
+                  runAction(async () => {
+                    await api.poison(true);
+                    await api.sample();
+                  })
+                }
+              >
+                Poison system prompt
+              </button>
+              <button
+                className="btn"
+                disabled={busy || !status.system_prompt_poisoned}
+                onClick={() =>
+                  runAction(async () => {
+                    await api.poison(false);
+                    await api.sample();
+                  })
+                }
+              >
+                Clear poison
+              </button>
+            </>
+          )}
         </div>
         {error && <p className="error">{error}</p>}
       </header>
 
+      {!status?.demo_mode && <ConnectLLM onSaved={refresh} />}
+
       <section className="grid stats">
         <div className={`stat ${alertActive ? "alert" : ""}`}>
           <label>Overall drift</label>
-          <strong>
-            {overall ? overall.combined_score.toFixed(3) : "—"}
-          </strong>
+          <strong>{overall ? overall.combined_score.toFixed(3) : "—"}</strong>
         </div>
         <div className="stat">
           <label>MMD / KL / Cosine</label>
@@ -315,12 +397,6 @@ export default function App() {
                   <p>{compare.current_response || "No live sample yet."}</p>
                 </article>
               </div>
-              {compare.cosine_similarities.length > 0 && (
-                <p className="muted" style={{ marginTop: "0.75rem" }}>
-                  Cosine to nearest baselines:{" "}
-                  {compare.cosine_similarities.map((s) => s.toFixed(3)).join(", ")}
-                </p>
-              )}
             </>
           )}
         </div>
@@ -350,10 +426,6 @@ export default function App() {
                   <span className="muted">Δ {c.delta.toFixed(3)}</span>
                 </div>
               ))}
-              <p className="muted" style={{ marginTop: "0.4rem" }}>
-                Explained variance:{" "}
-                {((explain.total_explained || 0) * 100).toFixed(1)}%
-              </p>
             </div>
           )}
 

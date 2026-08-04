@@ -13,6 +13,15 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _and_where(*clauses: dict) -> dict:
+    parts = [c for c in clauses if c]
+    if not parts:
+        return {}
+    if len(parts) == 1:
+        return parts[0]
+    return {"$and": parts}
+
+
 class Embedder:
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -34,6 +43,7 @@ class Embedder:
         sample_id: int,
         text: str,
         *,
+        user_id: int,
         probe_id: str,
         category: str,
         is_baseline: bool,
@@ -43,11 +53,12 @@ class Embedder:
         if vector is None:
             vector = self.embed([text])[0]
         self.collection.upsert(
-            ids=[f"sample_{sample_id}"],
+            ids=[f"u{user_id}_sample_{sample_id}"],
             embeddings=[vector.tolist()],
             documents=[text],
             metadatas=[
                 {
+                    "user_id": int(user_id),
                     "sample_id": int(sample_id),
                     "probe_id": probe_id,
                     "category": category,
@@ -58,10 +69,14 @@ class Embedder:
         )
         return vector
 
-    def get_baseline_vectors(self, category: Optional[str] = None) -> np.ndarray:
-        where: dict = {"is_baseline": 1}
-        if category:
-            where = {"$and": [{"is_baseline": 1}, {"category": category}]}
+    def get_baseline_vectors(
+        self, user_id: int, category: Optional[str] = None
+    ) -> np.ndarray:
+        where = _and_where(
+            {"user_id": int(user_id)},
+            {"is_baseline": 1},
+            {"category": category} if category else {},
+        )
         try:
             result = self.collection.get(where=where, include=["embeddings"])
         except Exception:
@@ -72,11 +87,13 @@ class Embedder:
         return np.asarray(embeddings, dtype=np.float32)
 
     def get_recent_live_vectors(
-        self, category: Optional[str] = None, limit: int = 50
+        self, user_id: int, category: Optional[str] = None, limit: int = 50
     ) -> np.ndarray:
-        where: dict = {"is_baseline": 0}
-        if category:
-            where = {"$and": [{"is_baseline": 0}, {"category": category}]}
+        where = _and_where(
+            {"user_id": int(user_id)},
+            {"is_baseline": 0},
+            {"category": category} if category else {},
+        )
         try:
             result = self.collection.get(where=where, include=["embeddings", "metadatas"])
         except Exception:
@@ -93,13 +110,17 @@ class Embedder:
         return np.asarray(selected, dtype=np.float32)
 
     def nearest_baseline(
-        self, vector: np.ndarray, probe_id: str, k: int = 5
+        self, user_id: int, vector: np.ndarray, probe_id: str, k: int = 5
     ) -> tuple[list[float], list[str]]:
         try:
             result = self.collection.query(
                 query_embeddings=[vector.tolist()],
                 n_results=k,
-                where={"$and": [{"is_baseline": 1}, {"probe_id": probe_id}]},
+                where=_and_where(
+                    {"user_id": int(user_id)},
+                    {"is_baseline": 1},
+                    {"probe_id": probe_id},
+                ),
                 include=["distances", "documents"],
             )
         except Exception:
@@ -107,14 +128,17 @@ class Embedder:
 
         distances = (result.get("distances") or [[]])[0]
         documents = (result.get("documents") or [[]])[0]
-        # Chroma cosine distance = 1 - cosine_similarity
         similarities = [1.0 - float(d) for d in distances]
         return similarities, list(documents or [])
 
-    def all_baseline_docs(self, probe_id: str, limit: int = 5) -> list[str]:
+    def all_baseline_docs(self, user_id: int, probe_id: str, limit: int = 5) -> list[str]:
         try:
             result = self.collection.get(
-                where={"$and": [{"is_baseline": 1}, {"probe_id": probe_id}]},
+                where=_and_where(
+                    {"user_id": int(user_id)},
+                    {"is_baseline": 1},
+                    {"probe_id": probe_id},
+                ),
                 include=["documents", "metadatas"],
                 limit=limit,
             )

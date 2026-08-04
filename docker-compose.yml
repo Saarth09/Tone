@@ -1,20 +1,44 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tone
+      POSTGRES_PASSWORD: tone
+      POSTGRES_DB: tone
+    ports:
+      - "5432:5432"
+    volumes:
+      - tone-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tone -d tone"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     environment:
-      DEMO_MODE: "true"
+      DEMO_MODE: "${DEMO_MODE:-false}"
       SAMPLE_INTERVAL_MINUTES: "5"
-      DATABASE_URL: "sqlite+aiosqlite:///./data/tone.db"
+      DATABASE_URL: "postgresql+asyncpg://tone:tone@db:5432/tone"
       CHROMA_PATH: "./data/chroma"
+      SECRET_KEY: "${SECRET_KEY:-tone-dev-change-me-in-production}"
       LLM_BASE_URL: "${LLM_BASE_URL:-http://host.docker.internal:11434/v1}"
       LLM_API_KEY: "${LLM_API_KEY:-ollama}"
       LLM_MODEL: "${LLM_MODEL:-llama3.2}"
       SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL:-}"
       DRIFT_THRESHOLD: "0.40"
+      FRONTEND_URL: "${FRONTEND_URL:-http://localhost:3000}"
+      GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
+      GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
+      GOOGLE_REDIRECT_URI: "${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/auth/google/callback}"
     volumes:
       - tone-data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -30,3 +54,4 @@ services:
 
 volumes:
   tone-data:
+  tone-pgdata:

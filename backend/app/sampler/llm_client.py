@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 
 from app.config import get_settings
 from app.probes import Probe
+
+if TYPE_CHECKING:
+    from app.connections import ConnectionStore
 
 logger = logging.getLogger(__name__)
 
@@ -15,22 +18,42 @@ logger = logging.getLogger(__name__)
 class LLMClient:
     """OpenAI-compatible chat completions client (Ollama, vLLM, OpenAI, etc.)."""
 
-    def __init__(self) -> None:
+    def __init__(self, connections: Optional["ConnectionStore"] = None) -> None:
         self.settings = get_settings()
+        self.connections = connections
+        self.active_user_id: Optional[int] = None
+
+    def _endpoint(self) -> tuple[str, str, str, str]:
+        if self.connections is not None and self.active_user_id is not None:
+            live = self.connections.live_for(self.active_user_id)
+            return live.base_url, live.api_key, live.model, live.system_prompt
+        if self.connections is not None:
+            live = self.connections.live
+            return live.base_url, live.api_key, live.model, live.system_prompt
+        return (
+            self.settings.llm_base_url,
+            self.settings.llm_api_key,
+            self.settings.llm_model,
+            self.settings.llm_system_prompt,
+        )
 
     async def complete(self, prompt: str, system: Optional[str] = None) -> tuple[str, float]:
+        base_url, api_key, model, stored_system = self._endpoint()
         messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
+        effective_system = system if system is not None else (stored_system or None)
+        if effective_system:
+            messages.append({"role": "system", "content": effective_system})
         messages.append({"role": "user", "content": prompt})
 
-        url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        # httpx rejects "Bearer " (trailing space). Ollama ignores the key;
+        # use a placeholder when none is configured.
         headers = {
-            "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "Authorization": f"Bearer {api_key.strip() or 'none'}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": self.settings.llm_model,
+            "model": model,
             "messages": messages,
             "temperature": 0.7,
         }

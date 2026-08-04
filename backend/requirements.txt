@@ -4,6 +4,7 @@ httpx==0.28.1
 apscheduler==3.10.4
 sqlalchemy==2.0.36
 aiosqlite==0.20.0
+asyncpg==0.30.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
 sentence-transformers==3.3.1
@@ -13,3 +14,8 @@ scikit-learn==1.6.0
 scipy==1.14.1
 python-dotenv==1.0.1
 tiktoken==0.8.0
+PyJWT==2.10.1
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+email-validator==2.2.0
+cryptography==44.0.0

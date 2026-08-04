@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -57,21 +56,37 @@ class DriftDetector:
         return float((w_m * mmd + w_k * kl + w_c * cosine) / total)
 
     async def _texts(
-        self, session: AsyncSession, *, category: str, baseline: bool, limit: int
+        self,
+        session: AsyncSession,
+        *,
+        user_id: int,
+        category: str,
+        baseline: bool,
+        limit: int,
     ) -> list[str]:
         q = (
             select(Sample)
-            .where(Sample.category == category, Sample.is_baseline == baseline)
+            .where(
+                Sample.user_id == user_id,
+                Sample.category == category,
+                Sample.is_baseline == baseline,
+            )
             .order_by(Sample.created_at.desc())
             .limit(limit)
         )
         result = await session.execute(q)
         return [s.response for s in result.scalars().all()]
 
-    async def _cosine_drift(self, session: AsyncSession, category: str) -> tuple[float, dict]:
+    async def _cosine_drift(
+        self, session: AsyncSession, *, user_id: int, category: str
+    ) -> tuple[float, dict]:
         q = (
             select(Sample)
-            .where(Sample.category == category, Sample.is_baseline.is_(False))
+            .where(
+                Sample.user_id == user_id,
+                Sample.category == category,
+                Sample.is_baseline.is_(False),
+            )
             .order_by(Sample.created_at.desc())
             .limit(max(5, self.settings.recent_window_size // 3))
         )
@@ -85,7 +100,7 @@ class DriftDetector:
         for sample in live_samples:
             vector = self.embedder.embed([sample.response])[0]
             sims, _ = self.embedder.nearest_baseline(
-                vector, sample.probe_id, k=self.settings.cosine_k
+                user_id, vector, sample.probe_id, k=self.settings.cosine_k
             )
             sim = mean_top_k_similarity(sims)
             d = drift_from_similarity(sim)
@@ -95,13 +110,12 @@ class DriftDetector:
         return float(np.mean(drifts)) if drifts else 0.0, {"per_probe": per_probe}
 
     async def evaluate_category(
-        self, session: AsyncSession, category: str
+        self, session: AsyncSession, *, user_id: int, category: str
     ) -> CategoryDriftResult:
-        baseline_vecs = self.embedder.get_baseline_vectors(category)
-        # One probe-set worth of live vectors keeps the window sharp
+        baseline_vecs = self.embedder.get_baseline_vectors(user_id, category)
         per_category_window = max(5, self.settings.recent_window_size // 3)
         live_vecs = self.embedder.get_recent_live_vectors(
-            category, limit=per_category_window
+            user_id, category, limit=per_category_window
         )
 
         if len(baseline_vecs) and len(live_vecs):
@@ -116,20 +130,24 @@ class DriftDetector:
         mmd_score = normalize_mmd(raw_mmd)
 
         baseline_texts = await self._texts(
-            session, category=category, baseline=True, limit=200
+            session, user_id=user_id, category=category, baseline=True, limit=200
         )
         live_texts = await self._texts(
             session,
+            user_id=user_id,
             category=category,
             baseline=False,
             limit=per_category_window,
         )
         kl_score = token_kl_between_corpora(baseline_texts, live_texts)
-        cosine_score, cosine_details = await self._cosine_drift(session, category)
+        cosine_score, cosine_details = await self._cosine_drift(
+            session, user_id=user_id, category=category
+        )
 
-        # Fact probes: keyword failures are a hard signal
         if category == "fact":
-            fact_rate = await self._fact_failure_rate(session, limit=per_category_window)
+            fact_rate = await self._fact_failure_rate(
+                session, user_id=user_id, limit=per_category_window
+            )
             cosine_score = max(cosine_score, fact_rate)
             cosine_details["fact_failure_rate"] = fact_rate
 
@@ -154,10 +172,16 @@ class DriftDetector:
             details=details,
         )
 
-    async def _fact_failure_rate(self, session: AsyncSession, limit: int = 10) -> float:
+    async def _fact_failure_rate(
+        self, session: AsyncSession, *, user_id: int, limit: int = 10
+    ) -> float:
         q = (
             select(Sample)
-            .where(Sample.category == "fact", Sample.is_baseline.is_(False))
+            .where(
+                Sample.user_id == user_id,
+                Sample.category == "fact",
+                Sample.is_baseline.is_(False),
+            )
             .order_by(Sample.created_at.desc())
             .limit(limit)
         )
@@ -168,10 +192,14 @@ class DriftDetector:
             return 0.0
         return float(sum(1 for r in checked if r.fact_ok is False) / len(checked))
 
-    async def evaluate_all(self, session: AsyncSession) -> list[CategoryDriftResult]:
+    async def evaluate_all(
+        self, session: AsyncSession, *, user_id: int
+    ) -> list[CategoryDriftResult]:
         results: list[CategoryDriftResult] = []
         for cat in ProbeCategory:
-            results.append(await self.evaluate_category(session, cat.value))
+            results.append(
+                await self.evaluate_category(session, user_id=user_id, category=cat.value)
+            )
 
         if results:
             overall_mmd = float(np.mean([r.mmd_score for r in results]))
@@ -195,6 +223,7 @@ class DriftDetector:
         for r in results:
             session.add(
                 DriftScore(
+                    user_id=user_id,
                     category=r.category,
                     mmd_score=r.mmd_score,
                     kl_score=r.kl_score,
@@ -210,11 +239,10 @@ class DriftDetector:
         return results
 
     def pca_explanation(
-        self, category: Optional[str] = None, n_components: int = 3
+        self, user_id: int, category: Optional[str] = None, n_components: int = 3
     ) -> dict:
-        """Compare baseline vs live means in top PCA dimensions."""
-        baseline = self.embedder.get_baseline_vectors(category)
-        live = self.embedder.get_recent_live_vectors(category, limit=100)
+        baseline = self.embedder.get_baseline_vectors(user_id, category)
+        live = self.embedder.get_recent_live_vectors(user_id, category, limit=100)
         if len(baseline) < 3 or len(live) < 2:
             return {"available": False, "components": []}
 
