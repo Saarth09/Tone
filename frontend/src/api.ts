@@ -1,6 +1,10 @@
 const API_BASE = import.meta.env.VITE_API_URL || "";
 const TOKEN_KEY = "tone_token";
 
+export function apiUrl(path: string): string {
+  return `${API_BASE}${path}`;
+}
+
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
 }

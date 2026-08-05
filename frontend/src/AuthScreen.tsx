@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import { api } from "./api";
+import { api, apiUrl } from "./api";
 
 type Props = {
   onAuthed: () => void;
@@ -46,8 +46,8 @@ export default function AuthScreen({ onAuthed }: Props) {
   }
 
   function loginWithGoogle() {
-    // Full navigation so Google redirect + backend callback can complete
-    window.location.href = "/api/auth/google";
+    // Must hit the API host (VITE_API_URL on Railway; same-origin via Vite proxy locally)
+    window.location.href = apiUrl("/api/auth/google");
   }
 
   return (
