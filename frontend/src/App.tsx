@@ -64,7 +64,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (opts?: { silent?: boolean }) => {
     if (!getToken()) {
       setAuthed(false);
       return;
@@ -95,14 +95,18 @@ export default function App() {
         setAuthed(false);
         return;
       }
-      setError(err instanceof Error ? err.message : "Failed to load");
+      // Background polls often fail briefly while a long sample/baseline runs —
+      // don't flash "Failed to fetch" unless this was a user-triggered refresh.
+      if (!opts?.silent) {
+        setError(err instanceof Error ? err.message : "Failed to load");
+      }
     }
   }, []);
 
   useEffect(() => {
     if (!authed) return;
     refresh();
-    const id = setInterval(refresh, 8000);
+    const id = setInterval(() => refresh({ silent: true }), 8000);
     return () => clearInterval(id);
   }, [refresh, authed]);
 
@@ -137,7 +141,17 @@ export default function App() {
         setCompare(await api.compare(selectedProbe));
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Action failed");
+      // Long baseline/sample calls often outlive the browser request while the
+      // server keeps going — refresh counters and soften the timeout message.
+      await refresh({ silent: true });
+      const msg = err instanceof Error ? err.message : "Action failed";
+      if (/failed to fetch|networkerror|timeout/i.test(msg)) {
+        setError(
+          "Browser timed out waiting — the server may still be finishing. Watch BASELINE / LIVE sample counts."
+        );
+      } else {
+        setError(msg);
+      }
     } finally {
       setBusy(false);
     }
