@@ -66,51 +66,69 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const watchingRef = useRef<string | null>(null);
 
-  const refresh = useCallback(async (opts?: { silent?: boolean }) => {
-    if (!getToken()) {
-      setAuthed(false);
-      return;
-    }
+  const refreshHeavy = useCallback(async () => {
+    if (!getToken()) return;
     try {
-      const [me, s, d, l, h, p, e, a] = await Promise.all([
-        api.me(),
-        api.status(),
-        api.drift("overall"),
-        api.latest(),
-        api.heatmap(),
-        api.probes(),
-        api.explain(),
-        api.alerts(),
-      ]);
-      setUser(me);
-      setStatus(s);
-      setDriftHistory([...d].reverse());
-      setLatest(l);
+      const [h, e] = await Promise.all([api.heatmap(), api.explain()]);
       setHeatmap(h);
-      setProbes(p);
       setExplain(e);
-      setAlerts(a);
-      setError(null);
-      setAuthed(true);
-    } catch (err) {
+    } catch {
+      /* heavy endpoints can lag behind a sample job — ignore */
+    }
+  }, []);
+
+  const refresh = useCallback(
+    async (opts?: { silent?: boolean; coreOnly?: boolean }) => {
       if (!getToken()) {
         setAuthed(false);
         return;
       }
-      // Background polls often fail briefly while a long sample/baseline runs —
-      // don't flash "Failed to fetch" unless this was a user-triggered refresh.
-      if (!opts?.silent) {
-        setError(err instanceof Error ? err.message : "Failed to load");
+      try {
+        // Fast path: DB-only reads so scores/counts update immediately.
+        const [me, s, d, l, p, a] = await Promise.all([
+          api.me(),
+          api.status(),
+          api.drift("overall"),
+          api.latest(),
+          api.probes(),
+          api.alerts(),
+        ]);
+        setUser(me);
+        setStatus(s);
+        setDriftHistory([...d].reverse());
+        setLatest(l);
+        setProbes(p);
+        setAlerts(a);
+        setError(null);
+        setAuthed(true);
+        if (!opts?.coreOnly) {
+          void refreshHeavy();
+        }
+      } catch (err) {
+        if (!getToken()) {
+          setAuthed(false);
+          return;
+        }
+        // Background polls often fail briefly while a long sample/baseline runs —
+        // don't flash "Failed to fetch" unless this was a user-triggered refresh.
+        if (!opts?.silent) {
+          setError(err instanceof Error ? err.message : "Failed to load");
+        }
       }
-    }
-  }, []);
+    },
+    [refreshHeavy]
+  );
 
   useEffect(() => {
     if (!authed) return;
-    refresh();
-    const id = setInterval(() => refresh({ silent: true }), 8000);
-    return () => clearInterval(id);
-  }, [refresh, authed]);
+    void refresh();
+    const coreId = setInterval(() => void refresh({ silent: true, coreOnly: true }), 5000);
+    const heavyId = setInterval(() => void refreshHeavy(), 20000);
+    return () => {
+      clearInterval(coreId);
+      clearInterval(heavyId);
+    };
+  }, [refresh, refreshHeavy, authed]);
 
   useEffect(() => {
     if (!authed || !selectedProbe) return;
@@ -157,6 +175,36 @@ export default function App() {
           if (watchingRef.current === jobId) watchingRef.current = null;
           setBusy(false);
           setBusyLabel(null);
+
+          // Paint drift from the job payload before waiting on network refreshes.
+          const driftRows = job.result?.drift;
+          if (Array.isArray(driftRows)) {
+            const next: Record<string, DriftScore> = {};
+            const stamp = new Date().toISOString();
+            for (const row of driftRows as Array<Record<string, unknown>>) {
+              const category = String(row.category ?? "");
+              if (!category) continue;
+              next[category] = {
+                id: -1,
+                category,
+                mmd_score: Number(row.mmd_score ?? 0),
+                kl_score: Number(row.kl_score ?? 0),
+                cosine_score: Number(row.cosine_score ?? 0),
+                combined_score: Number(row.combined_score ?? 0),
+                threshold: Number(row.threshold ?? 0.4),
+                is_alert: Boolean(row.is_alert),
+                sample_count: Number(row.sample_count ?? 0),
+                created_at: stamp,
+              };
+            }
+            if (Object.keys(next).length) {
+              setLatest((prev) => ({ ...prev, ...next }));
+              if (next.overall) {
+                setDriftHistory((prev) => [...prev, next.overall]);
+              }
+            }
+          }
+
           await refresh({ silent: true });
           if (selectedProbe) {
             try {
@@ -172,7 +220,8 @@ export default function App() {
           throw new Error(job.error || "Job failed");
         }
         await new Promise((r) => setTimeout(r, 2000));
-        await refresh({ silent: true });
+        // Core only while sampling — avoid competing with the job for CPU embeddings.
+        await refresh({ silent: true, coreOnly: true });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed");

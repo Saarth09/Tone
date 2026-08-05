@@ -20,6 +20,7 @@ from app.db import SessionLocal, database_info, get_session, init_db
 from app.db.models import AlertEvent, DriftScore, LLMConnection, Sample, User
 from app.detector import DriftDetector
 from app.embedder import Embedder
+from app import heatmap_cache
 from app.jobs import jobs
 from app.probes import PROBES, get_probe
 from app.sampler import Sampler
@@ -214,6 +215,7 @@ async def create_baseline(
                 "Baseline failed — no samples collected. Check your LLM connection "
                 "(Test connection), then try again."
             )
+        heatmap_cache.invalidate(user.id)
         job.touch(message=f"Embedded {count} baseline samples")
         return {"baseline_samples": count, "ready": True}
 
@@ -246,6 +248,7 @@ async def trigger_sample(
             results = await runner.run_sample_and_detect(
                 session, user_id=user.id, probe_ids=body.probe_ids
             )
+        heatmap_cache.invalidate(user.id)
         return {
             "samples": len(results["samples"]),
             "drift": [
@@ -256,6 +259,8 @@ async def trigger_sample(
                     "mmd_score": r.mmd_score,
                     "kl_score": r.kl_score,
                     "cosine_score": r.cosine_score,
+                    "threshold": r.threshold,
+                    "sample_count": r.sample_count,
                 }
                 for r in results["drift"]
             ],
@@ -386,7 +391,12 @@ async def heatmap(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    cells: list[HeatmapCell] = []
+    cached = heatmap_cache.get(user.id)
+    if cached is not None:
+        return cached
+
+    assert embedder is not None
+    pairs: list[tuple] = []
     for probe in PROBES:
         latest_live = await session.scalar(
             select(Sample)
@@ -398,15 +408,30 @@ async def heatmap(
             .order_by(Sample.created_at.desc())
             .limit(1)
         )
-        score = 0.0
-        if latest_live and embedder is not None:
-            vec = embedder.embed([latest_live.response])[0]
-            sims, _ = embedder.nearest_baseline(user.id, vec, probe.id, k=5)
-            if sims:
-                score = 1.0 - sum(sims) / len(sims)
-            if probe.category.value == "fact" and latest_live.fact_ok is False:
-                score = max(score, 0.9)
-        cells.append(HeatmapCell(category=probe.category.value, probe_id=probe.id, score=score))
+        pairs.append((probe, latest_live))
+
+    def _compute() -> list[HeatmapCell]:
+        texts = [s.response for _, s in pairs if s is not None]
+        vectors = embedder.embed(texts) if texts else []
+        vi = 0
+        out: list[HeatmapCell] = []
+        for probe, latest_live in pairs:
+            score = 0.0
+            if latest_live is not None:
+                vec = vectors[vi]
+                vi += 1
+                sims, _ = embedder.nearest_baseline(user.id, vec, probe.id, k=5)
+                if sims:
+                    score = 1.0 - sum(sims) / len(sims)
+                if probe.category.value == "fact" and latest_live.fact_ok is False:
+                    score = max(score, 0.9)
+            out.append(
+                HeatmapCell(category=probe.category.value, probe_id=probe.id, score=score)
+            )
+        return out
+
+    cells = await asyncio.to_thread(_compute)
+    heatmap_cache.put(user.id, cells)
     return cells
 
 
