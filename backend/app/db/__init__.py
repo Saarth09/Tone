@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -18,17 +19,33 @@ def normalize_database_url(url: str) -> str:
     return url
 
 
+def _engine_kwargs(url: str) -> tuple[str, dict]:
+    """Translate libpq SSL query params into asyncpg-friendly connect args."""
+    kwargs: dict = {"echo": False, "pool_pre_ping": True}
+    if not url.startswith("postgresql"):
+        return url, kwargs
+
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    sslmode = (query.pop("sslmode", [None])[0] or query.pop("ssl", [None])[0] or "").lower()
+    if sslmode in {"require", "true", "1", "verify-ca", "verify-full"}:
+        # asyncpg accepts ssl=True; managed Postgres (Supabase/Neon/RDS) requires TLS
+        kwargs["connect_args"] = {"ssl": True}
+    clean = urlunparse(parsed._replace(query=urlencode({k: v[0] for k, v in query.items()})))
+    # Keep a small pool — free Supabase caps concurrent connections
+    kwargs["pool_size"] = 5
+    kwargs["max_overflow"] = 5
+    return clean, kwargs
+
+
 DATABASE_URL = normalize_database_url(settings.database_url)
 
 if DATABASE_URL.startswith("sqlite"):
     db_path = DATABASE_URL.split("///")[-1]
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-)
+_engine_url, _engine_opts = _engine_kwargs(DATABASE_URL)
+engine = create_async_engine(_engine_url, **_engine_opts)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 

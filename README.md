@@ -94,12 +94,15 @@ Tables are created on API startup or via `python -m scripts.init_db`. Confirm: `
 ## Deploy on Railway
 
 1. Push this repo to GitHub and create a Railway project from it.
-2. **Backend service** — Root Directory `backend`, Dockerfile builder. Attach a volume at `/app/data`.
-3. Set backend env: `SECRET_KEY`, `DEMO_MODE=false`, `DATABASE_URL=sqlite+aiosqlite:///./data/tone.db`, `FRONTEND_URL`, Google OAuth vars if used.
-4. **Frontend service** — Root Directory `frontend`. Build arg `VITE_API_URL=https://<backend-public-url>`.
-5. In Google Cloud Console, add the production redirect URI: `https://<backend>/api/auth/google/callback`.
+2. **Backend service** — Root Directory `backend`, Dockerfile builder. Attach a volume at `/app/data` (for Chroma embeddings).
+3. **Postgres** — Add Railway’s Postgres plugin (free tier / trial credits). Set backend `DATABASE_URL` to `${{Postgres.DATABASE_URL}}` (Tone auto-upgrades it to `asyncpg`).
+4. Set backend env: `SECRET_KEY`, `DEMO_MODE=false`, `FRONTEND_URL`, Google OAuth vars if used.
+5. **Frontend service** — Root Directory `frontend`. Build arg / var `VITE_API_URL=https://<backend-public-url>`.
+6. In Google Cloud Console, add the production redirect URI: `https://<backend>/api/auth/google/callback`.
 
 Customers must connect a **public** OpenAI-compatible LLM endpoint (OpenAI, OpenRouter, hosted vLLM). Local Ollama (`localhost`) only works when Tone itself is running on the same machine.
+
+> Prefer Supabase/Neon later? Paste their session-mode Postgres URL into `DATABASE_URL` with `?ssl=require` — same app code.
 
 ## Auth + per-user isolation
 
