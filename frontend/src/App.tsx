@@ -151,8 +151,12 @@ export default function App() {
     try {
       for (;;) {
         const job = await api.getJob(jobId);
-        setBusyLabel(job.message || fallbackLabel);
         if (job.status === "succeeded") {
+          // Drop the banner immediately — don't sit on "Done" with a spinner
+          // while the slow post-job dashboard refresh finishes.
+          if (watchingRef.current === jobId) watchingRef.current = null;
+          setBusy(false);
+          setBusyLabel(null);
           await refresh({ silent: true });
           if (selectedProbe) {
             try {
@@ -163,6 +167,7 @@ export default function App() {
           }
           return;
         }
+        setBusyLabel(job.message || fallbackLabel);
         if (job.status === "failed") {
           throw new Error(job.error || "Job failed");
         }
@@ -173,9 +178,11 @@ export default function App() {
       setError(err instanceof Error ? err.message : "Action failed");
       await refresh({ silent: true });
     } finally {
-      if (watchingRef.current === jobId) watchingRef.current = null;
-      setBusy(false);
-      setBusyLabel(null);
+      if (watchingRef.current === jobId) {
+        watchingRef.current = null;
+        setBusy(false);
+        setBusyLabel(null);
+      }
     }
   }
 
