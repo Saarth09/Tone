@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -122,7 +123,7 @@ app.include_router(auth_router)
 @app.get("/api/health")
 async def health():
     try:
-        db = await database_info()
+        db = await asyncio.wait_for(database_info(), timeout=5.0)
     except Exception as exc:
         return {"ok": False, "service": "tone", "database": {"error": str(exc)}}
     return {"ok": True, "service": "tone", "database": db}

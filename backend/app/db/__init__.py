@@ -28,13 +28,15 @@ def _engine_kwargs(url: str) -> tuple[str, dict]:
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     sslmode = (query.pop("sslmode", [None])[0] or query.pop("ssl", [None])[0] or "").lower()
+    connect_args: dict = {"timeout": 10}
     if sslmode in {"require", "true", "1", "verify-ca", "verify-full"}:
         # asyncpg accepts ssl=True; managed Postgres (Supabase/Neon/RDS) requires TLS
-        kwargs["connect_args"] = {"ssl": True}
+        connect_args["ssl"] = True
+    kwargs["connect_args"] = connect_args
     clean = urlunparse(parsed._replace(query=urlencode({k: v[0] for k, v in query.items()})))
-    # Keep a small pool — free Supabase caps concurrent connections
     kwargs["pool_size"] = 5
     kwargs["max_overflow"] = 5
+    kwargs["pool_timeout"] = 10
     return clean, kwargs
 
 

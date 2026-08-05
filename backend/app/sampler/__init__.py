@@ -104,22 +104,22 @@ class Sampler:
 
     async def establish_baseline(
         self, session: AsyncSession, *, user_id: int, runs: Optional[int] = None
-    ) -> int:
+    ) -> list[Sample]:
         runs = runs or self.settings.baseline_runs
         per_probe = max(1, runs // max(1, len(PROBES)))
-        total = 0
+        collected: list[Sample] = []
         for _ in range(per_probe):
             batch = await self.run_cycle(session, user_id=user_id, is_baseline=True)
-            total += len(batch)
+            collected.extend(batch)
 
         key = baseline_key(user_id)
-        if total <= 0:
+        if not collected:
             # Do not mark ready when every probe call failed (e.g. bad LLM config).
             state = await session.get(SystemState, key)
             if state is not None:
                 state.value = "false"
             await session.commit()
-            return total
+            return collected
 
         state = await session.get(SystemState, key)
         if state is None:
@@ -127,7 +127,7 @@ class Sampler:
         else:
             state.value = "true"
         await session.commit()
-        return total
+        return collected
 
     async def is_baseline_ready(self, session: AsyncSession, user_id: int) -> bool:
         state = await session.get(SystemState, baseline_key(user_id))

@@ -70,34 +70,36 @@ class JobRunner:
                     logger.exception("Scheduled cycle failed for user %s", user_id)
 
     async def embed_samples(self, samples: list[Sample]) -> None:
-        for sample in samples:
-            created = sample.created_at or datetime.now(timezone.utc)
-            self.embedder.store(
-                sample.id,
-                sample.response,
-                user_id=sample.user_id,
-                probe_id=sample.probe_id,
-                category=sample.category,
-                is_baseline=sample.is_baseline,
-                created_at=created.isoformat(),
-            )
+        if not samples:
+            return
+
+        # sentence-transformers encode is CPU-blocking — never run on the event loop
+        # or the whole API freezes (browser shows "Failed to fetch").
+        def _run() -> None:
+            for sample in samples:
+                created = sample.created_at or datetime.now(timezone.utc)
+                self.embedder.store(
+                    sample.id,
+                    sample.response,
+                    user_id=sample.user_id,
+                    probe_id=sample.probe_id,
+                    category=sample.category,
+                    is_baseline=sample.is_baseline,
+                    created_at=created.isoformat(),
+                )
+
+        await asyncio.to_thread(_run)
 
     async def run_baseline(
         self, session, *, user_id: int, runs: Optional[int] = None
     ) -> int:
         async with self._lock:
             await self.connections.load_user(session, user_id)
-            samples_total = await self.sampler.establish_baseline(
+            samples = await self.sampler.establish_baseline(
                 session, user_id=user_id, runs=runs
             )
-            result = await session.execute(
-                select(Sample).where(
-                    Sample.user_id == user_id, Sample.is_baseline.is_(True)
-                )
-            )
-            samples = list(result.scalars().all())
             await self.embed_samples(samples)
-            return samples_total
+            return len(samples)
 
     async def run_sample_and_detect(
         self,
