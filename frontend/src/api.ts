@@ -41,6 +41,17 @@ export type User = {
   auth_provider?: string;
 };
 
+export type Job = {
+  id: string;
+  kind: "baseline" | "sample" | string;
+  status: "queued" | "running" | "succeeded" | "failed" | string;
+  message: string;
+  error?: string | null;
+  result?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type Status = {
   baseline_ready: boolean;
   demo_mode: boolean;
@@ -56,6 +67,7 @@ export type Status = {
   llm_connected: boolean;
   llm_connection_name: string | null;
   llm_provider: string | null;
+  active_job?: Job | null;
 };
 
 export type DriftScore = {
@@ -176,8 +188,11 @@ export const api = {
       `/api/explainability${category ? `?category=${category}` : ""}`
     ),
   alerts: () => request<Alert[]>("/api/alerts"),
-  sample: () => request("/api/sample", { method: "POST", body: "{}" }),
-  baseline: () => request("/api/baseline", { method: "POST", body: "{}" }),
+  sample: () =>
+    request<Job & { job_id: string }>("/api/sample", { method: "POST", body: "{}" }),
+  baseline: () =>
+    request<Job & { job_id: string }>("/api/baseline", { method: "POST", body: "{}" }),
+  getJob: (jobId: string) => request<Job>(`/api/jobs/${jobId}`),
   setDrift: (enable: boolean) =>
     request("/api/demo/drift", {
       method: "POST",

@@ -20,6 +20,7 @@ from app.db import SessionLocal, database_info, get_session, init_db
 from app.db.models import AlertEvent, DriftScore, LLMConnection, Sample, User
 from app.detector import DriftDetector
 from app.embedder import Embedder
+from app.jobs import jobs
 from app.probes import PROBES, get_probe
 from app.sampler import Sampler
 from app.sampler.llm_client import DemoLLMClient
@@ -31,6 +32,7 @@ from app.schemas import (
     DriftScoreOut,
     DriftSimulateRequest,
     HeatmapCell,
+    JobOut,
     LLMConnectionIn,
     LLMConnectionOut,
     LLMConnectionTestIn,
@@ -175,6 +177,7 @@ async def status(
         llm_connected=cfg.connected,
         llm_connection_name=cfg.name if cfg.connected else None,
         llm_provider=cfg.provider if cfg.connected else None,
+        active_job=JobOut(**active.to_dict()) if (active := jobs.active_for_user(user.id)) else None,
     )
 
 
@@ -194,46 +197,88 @@ async def list_probes(user: User = Depends(get_current_user)):
 @app.post("/api/baseline")
 async def create_baseline(
     body: BaselineRequest,
-    session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
+    """Start baseline sampling as a background job (avoids proxy timeouts)."""
     assert runner is not None
-    count = await runner.run_baseline(session, user_id=user.id, runs=body.runs)
-    if count <= 0:
-        raise HTTPException(
-            400,
-            "Baseline failed — no samples collected. Check your LLM connection "
-            "(Test connection), then try again.",
+
+    async def _work(job):
+        job.touch(message="Calling your LLM for baseline probes…")
+        async with SessionLocal() as session:
+            if not await connections.get_active_row(session, user.id):
+                # still allow demo / env fallback
+                pass
+            count = await runner.run_baseline(session, user_id=user.id, runs=body.runs)
+        if count <= 0:
+            raise RuntimeError(
+                "Baseline failed — no samples collected. Check your LLM connection "
+                "(Test connection), then try again."
+            )
+        job.touch(message=f"Embedded {count} baseline samples")
+        return {"baseline_samples": count, "ready": True}
+
+    try:
+        job = await jobs.start(
+            user_id=user.id,
+            kind="baseline",
+            message="Starting baseline…",
+            coro_factory=_work,
         )
-    return {"baseline_samples": count, "ready": True}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"job_id": job.id, **job.to_dict()}
 
 
 @app.post("/api/sample")
 async def trigger_sample(
     body: SampleRequest,
-    session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
+    """Start a live sample + drift cycle as a background job."""
     assert runner is not None and sampler is not None
-    if not await sampler.is_baseline_ready(session, user.id):
-        raise HTTPException(400, "Baseline not established. Call POST /api/baseline first.")
-    results = await runner.run_sample_and_detect(
-        session, user_id=user.id, probe_ids=body.probe_ids
-    )
-    return {
-        "samples": len(results["samples"]),
-        "drift": [
-            {
-                "category": r.category,
-                "combined_score": r.combined_score,
-                "is_alert": r.is_alert,
-                "mmd_score": r.mmd_score,
-                "kl_score": r.kl_score,
-                "cosine_score": r.cosine_score,
-            }
-            for r in results["drift"]
-        ],
-    }
+
+    async def _work(job):
+        job.touch(message="Calling your LLM for live probes…")
+        async with SessionLocal() as session:
+            if not await sampler.is_baseline_ready(session, user.id):
+                raise RuntimeError("Baseline not established. Establish a baseline first.")
+            job.touch(message="Sampling probes and computing drift…")
+            results = await runner.run_sample_and_detect(
+                session, user_id=user.id, probe_ids=body.probe_ids
+            )
+        return {
+            "samples": len(results["samples"]),
+            "drift": [
+                {
+                    "category": r.category,
+                    "combined_score": r.combined_score,
+                    "is_alert": r.is_alert,
+                    "mmd_score": r.mmd_score,
+                    "kl_score": r.kl_score,
+                    "cosine_score": r.cosine_score,
+                }
+                for r in results["drift"]
+            ],
+        }
+
+    try:
+        job = await jobs.start(
+            user_id=user.id,
+            kind="sample",
+            message="Starting sample cycle…",
+            coro_factory=_work,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"job_id": job.id, **job.to_dict()}
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobOut)
+async def get_job(job_id: str, user: User = Depends(get_current_user)):
+    job = jobs.get(job_id)
+    if job is None or job.user_id != user.id:
+        raise HTTPException(404, "Job not found")
+    return JobOut(**job.to_dict())
 
 
 @app.get("/api/samples", response_model=list[SampleOut])

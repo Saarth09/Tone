@@ -123,6 +123,38 @@ select {
   cursor: not-allowed;
 }
 
+.spinner {
+  width: 1.15rem;
+  height: 1.15rem;
+  border: 2px solid rgba(61, 190, 132, 0.25);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: tone-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes tone-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.busy-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.85rem;
+  margin-top: 0.85rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid rgba(61, 190, 132, 0.35);
+  background: linear-gradient(180deg, rgba(61, 190, 132, 0.12), rgba(61, 190, 132, 0.04));
+  border-radius: 0.5rem;
+}
+
+.busy-banner strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;

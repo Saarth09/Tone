@@ -43,6 +43,19 @@ class DriftScoreOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class JobOut(BaseModel):
+    id: str
+    kind: str
+    status: str
+    message: str = ""
+    error: Optional[str] = None
+    result: Optional[dict] = None
+    created_at: str
+    updated_at: str
+
+    model_config = {"extra": "ignore"}
+
+
 class StatusOut(BaseModel):
     baseline_ready: bool
     demo_mode: bool
@@ -58,6 +71,7 @@ class StatusOut(BaseModel):
     llm_connected: bool = False
     llm_connection_name: Optional[str] = None
     llm_provider: Optional[str] = None
+    active_job: Optional[JobOut] = None
 
 
 class BaselineRequest(BaseModel):

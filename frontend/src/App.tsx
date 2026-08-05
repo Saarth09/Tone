@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CartesianGrid,
   Legend,
@@ -62,7 +62,9 @@ export default function App() {
   const [explain, setExplain] = useState<Explainability | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const watchingRef = useRef<string | null>(null);
 
   const refresh = useCallback(async (opts?: { silent?: boolean }) => {
     if (!getToken()) {
@@ -128,11 +130,76 @@ export default function App() {
     [driftHistory]
   );
 
+  // Resume a job banner if the server still has one running (e.g. after refresh)
+  useEffect(() => {
+    const job = status?.active_job;
+    if (!job) return;
+    if (job.status !== "queued" && job.status !== "running") return;
+    if (watchingRef.current) return;
+    void watchJob(job.id, job.kind === "baseline" ? "Establishing baseline…" : "Running sample cycle…");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status?.active_job?.id, status?.active_job?.status]);
+
   const overall = latest.overall;
   const alertActive = Boolean(overall?.is_alert);
 
+  async function watchJob(jobId: string, fallbackLabel: string) {
+    watchingRef.current = jobId;
+    setBusy(true);
+    setError(null);
+    setBusyLabel(fallbackLabel);
+    try {
+      for (;;) {
+        const job = await api.getJob(jobId);
+        setBusyLabel(job.message || fallbackLabel);
+        if (job.status === "succeeded") {
+          await refresh({ silent: true });
+          if (selectedProbe) {
+            try {
+              setCompare(await api.compare(selectedProbe));
+            } catch {
+              /* ignore */
+            }
+          }
+          return;
+        }
+        if (job.status === "failed") {
+          throw new Error(job.error || "Job failed");
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+        await refresh({ silent: true });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Action failed");
+      await refresh({ silent: true });
+    } finally {
+      if (watchingRef.current === jobId) watchingRef.current = null;
+      setBusy(false);
+      setBusyLabel(null);
+    }
+  }
+
+  async function runJob(start: () => Promise<{ job_id: string }>, label: string) {
+    if (watchingRef.current) return;
+    watchingRef.current = "pending";
+    setBusy(true);
+    setBusyLabel(label);
+    setError(null);
+    try {
+      const started = await start();
+      await watchJob(started.job_id, label);
+    } catch (err) {
+      watchingRef.current = null;
+      setBusy(false);
+      setBusyLabel(null);
+      setError(err instanceof Error ? err.message : "Action failed");
+      await refresh({ silent: true });
+    }
+  }
+
   async function runAction(fn: () => Promise<unknown>) {
     setBusy(true);
+    setBusyLabel("Working…");
     setError(null);
     try {
       await fn();
@@ -141,19 +208,11 @@ export default function App() {
         setCompare(await api.compare(selectedProbe));
       }
     } catch (err) {
-      // Long baseline/sample calls often outlive the browser request while the
-      // server keeps going — refresh counters and soften the timeout message.
       await refresh({ silent: true });
-      const msg = err instanceof Error ? err.message : "Action failed";
-      if (/failed to fetch|networkerror|timeout/i.test(msg)) {
-        setError(
-          "Browser timed out waiting — the server may still be finishing. Watch BASELINE / LIVE sample counts."
-        );
-      } else {
-        setError(msg);
-      }
+      setError(err instanceof Error ? err.message : "Action failed");
     } finally {
       setBusy(false);
+      setBusyLabel(null);
     }
   }
 
@@ -220,16 +279,25 @@ export default function App() {
                 ? undefined
                 : "Establish a baseline before running live sample cycles"
             }
-            onClick={() => runAction(() => api.sample())}
+            onClick={() => runJob(() => api.sample(), "Running sample cycle…")}
           >
-            Run sample cycle
+            {busy && busyLabel?.includes("sample") ? "Sampling…" : "Run sample cycle"}
           </button>
           <button
             className="btn"
             disabled={busy}
-            onClick={() => runAction(() => api.baseline())}
+            onClick={() =>
+              runJob(
+                () => api.baseline(),
+                status?.baseline_ready ? "Rebuilding baseline…" : "Establishing baseline…"
+              )
+            }
           >
-            {status?.baseline_ready ? "Rebuild baseline" : "Establish baseline"}
+            {busy && busyLabel?.toLowerCase().includes("baseline")
+              ? busyLabel.replace("…", "") + "…"
+              : status?.baseline_ready
+                ? "Rebuild baseline"
+                : "Establish baseline"}
           </button>
           {status?.demo_mode && (
             <>
@@ -283,6 +351,18 @@ export default function App() {
             </>
           )}
         </div>
+        {busy && busyLabel && (
+          <div className="busy-banner" role="status" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <div>
+              <strong>{busyLabel}</strong>
+              <p className="muted" style={{ margin: "0.15rem 0 0" }}>
+                This can take a few minutes. You can leave this tab open — progress updates
+                automatically.
+              </p>
+            </div>
+          </div>
+        )}
         {error && <p className="error">{error}</p>}
       </header>
 
