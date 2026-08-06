@@ -3,7 +3,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 COPY . .
-ARG VITE_API_URL=https://backend-production-5245.up.railway.app
+ARG VITE_API_URL=https://api.tonehq.xyz
 ENV VITE_API_URL=$VITE_API_URL
 RUN npm run build
 
