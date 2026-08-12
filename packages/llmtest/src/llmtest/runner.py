@@ -7,9 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from llmtest.assertions import similarity_to_text, similarity_to_vector
+from llmtest.assertions import similarity_to_text, similarity_to_vector, get_embedder
 from llmtest.baseline import load_baseline, save_baseline
-from llmtest.embedder import get_embedder
 from llmtest.suite import LLMTestSuite, TestCase
 
 

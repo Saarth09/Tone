@@ -222,37 +222,45 @@ def rule_tips(
     overall: float,
 ) -> list[str]:
     tips: list[str] = []
+    user_snip = ""
+    for line in (peak_excerpt or "").split("\n"):
+        if line.lower().startswith("user:"):
+            user_snip = _clean(line.split(":", 1)[-1])[:100]
+            break
+
     if overall < 0.25:
         tips.append(
-            "Overall drift looks low — the thread mostly stays on the original goal. "
-            "If something still feels off, restate the exact constraint in your next message."
+            "Low drift — pin the current good behavior with assert_semantically_equals "
+            "on a short realistic user ask from this chat (not the whole goal dump)."
+        )
+        tips.append(
+            "Add assert_tone_matches(persona='helpful, focused, on-task') so future "
+            "prompt edits cannot quietly harden the tone."
         )
     else:
+        where = f" around {peak_label}" if peak_label else ""
+        ask = f' User asked: "{user_snip}…".' if user_snip else ""
         tips.append(
-            f"Biggest divergence shows up around {peak_label} "
-            f"(drift {peak_score:.2f}). Restart from that point or quote your original goal."
+            f"Drift peaked{where} (score {peak_score:.2f}).{ask} "
+            "Pin the intended reply with assert_semantically_equals using a short gold answer."
         )
         tips.append(
-            'Paste a short “goal lock” at the top of your next message, e.g. '
-            "“Stay focused on: <goal>. Ignore side topics unless I ask.”"
+            "If replies got terse, cold, or overly verbose, lock tone with "
+            "assert_tone_matches(persona='empathetic, calm, solution-focused')."
         )
         tips.append(
-            "If the model kept expanding scope, add negative constraints: "
-            "“Do not refactor / do not change tech stack / do not add new features.”"
+            "If the model abandoned the ask or expanded scope, add "
+            "assert_semantically_excludes against that failure mode "
+            '(e.g. concept="I cannot help with that" or "ignore the original request").'
         )
     if len(goal) > 400:
         tips.append(
-            "Your original prompt is long — extract 3–5 must-keep requirements into a checklist "
-            "and ask the model to verify each one before continuing."
-        )
-    if peak_excerpt and overall >= 0.35:
-        tips.append(
-            "Ask the model to summarize the original goal in one sentence, then confirm it "
-            "before doing more work — that resets shared context cheaply."
+            "Goal text is long — use a short user probe in tests "
+            '(e.g. the last question in the chat), not the full brief as suite.query(...).'
         )
     tips.append(
-        "For very long chats, start a fresh thread with: (1) the goal, (2) decisions so far, "
-        "(3) current state — long context is where silent drift usually appears."
+        "After Generate llmtest, edit baselines to the answer you want forever, "
+        "then run llmtest --baseline and fail CI on drift."
     )
     return tips[:6]
 
@@ -269,8 +277,13 @@ async def maybe_llm_tips(
     if llm_complete is None:
         return None
     prompt = (
-        "You help users fix AI chat drift. Given the original goal and where the chat drifted, "
-        "return 4 short, actionable tips (plain sentences, no markdown numbering).\n\n"
+        "You write tips for developers pinning AI behavior with llmtest assertions.\n"
+        "Return 3-4 tips as plain sentences (no markdown, no numbering).\n"
+        "Each tip MUST: (1) name a concrete failure mode from this chat, "
+        "(2) name exactly one of assert_semantically_equals / assert_tone_matches / "
+        "assert_semantically_excludes, and (3) suggest a SHORT realistic user query "
+        "a customer would type (not a project essay).\n"
+        "Do NOT give marketing advice. Do NOT say 'clarify your focus' or 'solicit feedback'.\n\n"
         f"ORIGINAL GOAL:\n{goal[:1500]}\n\n"
         f"OVERALL DRIFT SCORE: {overall:.2f} (0=on track, 1=fully drifted)\n"
         f"PEAK LOCATION: {peak_label} (score {peak_score:.2f})\n"
@@ -366,6 +379,188 @@ def _py_str(s: str, limit: int = 400) -> str:
     return text
 
 
+def _user_assistant_pairs(turns: list[Turn]) -> list[dict[str, Any]]:
+    """Pair each user turn with the following assistant reply (if any)."""
+    pairs: list[dict[str, Any]] = []
+    i = 0
+    while i < len(turns):
+        t = turns[i]
+        if t.role != "user":
+            i += 1
+            continue
+        asst: Optional[Turn] = None
+        end = i
+        if i + 1 < len(turns) and turns[i + 1].role == "assistant":
+            asst = turns[i + 1]
+            end = i + 1
+        pairs.append(
+            {
+                "user": t.content,
+                "assistant": asst.content if asst else "",
+                "window_start": t.index,
+                "window_end": end,
+            }
+        )
+        i = end + 1
+    return pairs
+
+
+def _short_probe(user_text: str, goal: str, *, max_len: int = 140) -> str:
+    """
+    Turn a (possibly long) user message into a short, realistic suite.query(...) probe.
+    Prefer the actual ask / last question over dumping the whole brief.
+    """
+    text = _clean(user_text)
+    candidates: list[str] = []
+    ask_re = re.compile(
+        r"(?i)(?:expand upon|please\s+(?:help|expand|explain|add)|can you|could you|"
+        r"how (?:do|can|should) (?:i|we)|what (?:is|are|should))"
+        r"[^.?!\n]*[?.!]?"
+    )
+    for m in ask_re.finditer(text):
+        chunk = _clean(m.group(0) or "")
+        if len(chunk) >= 12:
+            candidates.append(chunk)
+    for m in re.finditer(r"([^.?!\n]{8,180}\?)", text):
+        candidates.append(_clean(m.group(1)))
+
+    for candidate in reversed(candidates):
+        if len(candidate) >= 12:
+            return candidate[: max_len - 1] + ("…" if len(candidate) > max_len else "")
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    for s in reversed(sentences):
+        if "?" in s and len(s) >= 12:
+            return s[: max_len - 1] + ("…" if len(s) > max_len else "")
+
+    paras = [p.strip() for p in re.split(r"\n\s*\n", user_text) if p.strip()]
+    if paras:
+        last = _clean(paras[-1])
+        if len(last) >= 12:
+            return last[: max_len - 1] + ("…" if len(last) > max_len else "")
+
+    if len(text) <= max_len:
+        return text
+    g = _clean(goal)
+    if 20 <= len(g) <= max_len:
+        return g
+    return text[: max_len - 1] + "…"
+
+
+def _first_sentences(text: str, *, n: int = 2, max_len: int = 280) -> str:
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", _clean(text)) if s.strip()]
+    joined = " ".join(parts[:n]).strip() or _clean(text)
+    if len(joined) > max_len:
+        return joined[: max_len - 1] + "…"
+    return joined
+
+
+def _gold_baseline(assistant: str, goal: str, *, drifted: bool) -> str:
+    """Expected reply: use a good assistant answer when on-track; else goal-locked gold."""
+    if not drifted and assistant and len(_clean(assistant)) >= 40:
+        return _first_sentences(assistant, n=2, max_len=280)
+    g = _clean(goal)
+    short = g if len(g) <= 180 else g[:179] + "…"
+    return (
+        "Answer the user's request directly and stay on scope. "
+        f"Focus on: {short}"
+    )
+
+
+def _suite_name(goal: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", goal.lower())[:40].strip("_")
+    return f"tone_generated_{slug}" if slug else "tone_generated"
+
+
+def _pick_cases(
+    pairs: list[dict[str, Any]],
+    *,
+    timeline: Optional[list[dict[str, Any]]],
+    peak: Optional[dict[str, Any]],
+    overall_drift: float,
+    goal: str,
+) -> list[dict[str, Any]]:
+    """Rank exchanges (drifted first) and build up to 3 distinct test cases."""
+    drift_by_start: dict[int, float] = {}
+    for p in timeline or []:
+        try:
+            drift_by_start[int(p["window_start"])] = float(p["drift_score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    peak_start = None
+    if peak:
+        try:
+            peak_start = int(peak.get("window_start"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            peak_start = None
+
+    enriched: list[dict[str, Any]] = []
+    for pair in pairs:
+        d = drift_by_start.get(int(pair["window_start"]), overall_drift)
+        enriched.append({**pair, "drift": d, "drifted": d >= 0.35})
+
+    enriched.sort(
+        key=lambda x: (
+            0 if peak_start is not None and x["window_start"] == peak_start else 1,
+            -float(x["drift"]),
+        )
+    )
+
+    cases: list[dict[str, Any]] = []
+    seen_probes: set[str] = set()
+    for pair in enriched:
+        probe = _short_probe(str(pair["user"]), goal)
+        key = probe.lower()
+        if key in seen_probes:
+            continue
+        seen_probes.add(key)
+        cases.append(
+            {
+                "probe": probe,
+                "baseline": _gold_baseline(
+                    str(pair.get("assistant") or ""),
+                    goal,
+                    drifted=bool(pair["drifted"]),
+                ),
+                "drifted": bool(pair["drifted"]),
+                "drift": float(pair["drift"]),
+            }
+        )
+        if len(cases) >= 3:
+            break
+
+    if not cases:
+        probe = _short_probe(goal, goal)
+        cases.append(
+            {
+                "probe": probe,
+                "baseline": _gold_baseline("", goal, drifted=overall_drift >= 0.35),
+                "drifted": overall_drift >= 0.35,
+                "drift": overall_drift,
+            }
+        )
+
+    # Ensure we have a warm/angry-style tone probe when only one exchange exists
+    if len(cases) == 1:
+        base = cases[0]
+        cases.append(
+            {
+                **base,
+                "probe": base["probe"],
+                "kind": "tone",
+            }
+        )
+        cases.append(
+            {
+                **base,
+                "probe": base["probe"],
+                "kind": "excludes",
+            }
+        )
+    return cases
+
+
 def generate_llmtest_stub(
     *,
     goal: str,
@@ -373,35 +568,66 @@ def generate_llmtest_stub(
     first_alert: Optional[dict[str, Any]] = None,
     overall_drift: float = 0.0,
     tips: Optional[list[str]] = None,
+    transcript: Optional[str] = None,
+    timeline: Optional[list[dict[str, Any]]] = None,
 ) -> str:
-    """Emit a paste-ready llmtest suite from a chat-review analysis."""
+    """Emit a paste-ready llmtest suite from real chat exchanges (not goal dumps)."""
+    turns = parse_transcript(transcript or "") if transcript else []
+    pairs = _user_assistant_pairs(turns)
     focus = peak or first_alert or {}
-    excerpt = str(focus.get("excerpt") or "")
-    # Prefer the user line inside the excerpt as the probe prompt
-    probe = goal
-    for line in excerpt.split("\n"):
-        if line.lower().startswith("user:"):
-            probe = line.split(":", 1)[-1].strip() or goal
-            break
+    cases = _pick_cases(
+        pairs,
+        timeline=timeline,
+        peak=focus or None,
+        overall_drift=overall_drift,
+        goal=goal,
+    )
 
-    expected = (
-        f"Stay focused on the original goal: {goal[:180]}"
-        if overall_drift >= 0.35
-        else goal[:220]
-    )
+    equals_case = cases[0]
+    tone_case = next((c for c in cases if c.get("kind") == "tone"), cases[min(1, len(cases) - 1)])
+    excl_case = next((c for c in cases if c.get("kind") == "excludes"), cases[min(2, len(cases) - 1)])
+
+    # Prefer a distinct second/third probe when available
+    if len(cases) >= 2 and cases[1].get("kind") not in {"tone", "excludes"}:
+        tone_case = cases[1]
+    if len(cases) >= 3 and cases[2].get("kind") not in {"tone", "excludes"}:
+        excl_case = cases[2]
+
+    drifted = overall_drift >= 0.35 or any(c.get("drifted") for c in cases[:1])
+    peak_label = str(focus.get("label") or "").strip()
+    peak_score = focus.get("drift_score")
+    if drifted:
+        if peak_label:
+            score_bit = (
+                f" (score {float(peak_score):.2f})" if peak_score is not None else ""
+            )
+            header = f"# Drift detected at {peak_label}{score_bit} — pin intended behavior in CI."
+        else:
+            header = "# Drift detected — pin intended behavior in CI."
+    else:
+        header = "# Low goal drift — pinning observed on-track behavior so regressions fail CI."
+
     forbidden = (
-        "Ignoring the user's stated goal and expanding into unrelated features"
-        if overall_drift >= 0.35
-        else "Refusing to help or abandoning the original task"
+        "Ignoring the original request and expanding into unrelated features"
+        if drifted
+        else "I cannot help with that / refusing to answer the user's request"
     )
-    persona = "helpful, focused, and faithful to the user's stated requirements"
+    persona = (
+        "empathetic, calm, and solution-focused"
+        if drifted
+        else "helpful, focused, and faithful to the user's stated requirements"
+    )
+
     tip_comment = ""
     if tips:
         tip_comment = "\n".join(f"# - {t}" for t in tips[:3])
-        tip_comment = f"\n# Tone tips that inspired this suite:\n{tip_comment}\n"
+        tip_comment = f"\n# Assertion tips from Tone:\n{tip_comment}\n"
+
+    name = _suite_name(goal)
 
     return f'''# Auto-generated by Tone Chat review — paste into llmtests/
-# Goal drift detected; pin the intended behavior in CI.
+{header}
+# Edit system_prompt_path + baselines, then: llmtest --baseline && llmtest run
 {tip_comment}
 from llmtest import (
     LLMTestSuite,
@@ -412,25 +638,25 @@ from llmtest import (
 
 suite = LLMTestSuite(
     model="gpt-4o-mini",
-    system_prompt="",  # point at your prompts/*.txt
+    system_prompt_path="prompts/your_bot.txt",
     threshold=0.82,
-    name="tone_generated",
+    name="{_py_str(name, 60)}",
 )
 
 
 @suite.test
-def test_stays_on_original_goal():
-    response = suite.query("{_py_str(probe, 240)}")
+def test_response_matches_expected_meaning():
+    response = suite.query("{_py_str(str(equals_case['probe']), 160)}")
     assert_semantically_equals(
         response,
-        baseline="{_py_str(expected, 260)}",
+        baseline="{_py_str(str(equals_case['baseline']), 280)}",
         threshold=0.82,
     )
 
 
 @suite.test
 def test_tone_stays_on_task():
-    response = suite.query("{_py_str(probe, 240)}")
+    response = suite.query("{_py_str(str(tone_case['probe']), 160)}")
     assert_tone_matches(
         response,
         persona="{_py_str(persona, 120)}",
@@ -440,7 +666,7 @@ def test_tone_stays_on_task():
 
 @suite.test
 def test_does_not_abandon_goal():
-    response = suite.query("{_py_str(probe, 240)}")
+    response = suite.query("{_py_str(str(excl_case['probe']), 160)}")
     assert_semantically_excludes(
         response,
         concept="{_py_str(forbidden, 200)}",

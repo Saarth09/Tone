@@ -230,6 +230,8 @@ export default function ChatReview() {
                         tips: result.tips,
                         peak: result.peak,
                         first_alert: result.first_alert,
+                        transcript,
+                        timeline: result.timeline,
                       });
                       setGeneratedCode(out.code);
                       setCopied(false);

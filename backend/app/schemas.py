@@ -227,6 +227,11 @@ class ChatReviewGenerateTestIn(BaseModel):
     tips: list[str] = Field(default_factory=list)
     peak: Optional[ChatReviewPoint] = None
     first_alert: Optional[ChatReviewPoint] = None
+    transcript: Optional[str] = Field(
+        default=None,
+        description="Original transcript so probes/baselines come from real exchanges",
+    )
+    timeline: list[ChatReviewPoint] = Field(default_factory=list)
 
 
 class ChatReviewGenerateTestOut(BaseModel):

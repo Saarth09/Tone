@@ -258,6 +258,8 @@ export const api = {
     tips: string[];
     peak?: ChatReviewPoint | null;
     first_alert?: ChatReviewPoint | null;
+    transcript?: string;
+    timeline?: ChatReviewPoint[];
   }) =>
     request<{ code: string; filename_hint: string }>("/api/chat-review/generate-test", {
       method: "POST",

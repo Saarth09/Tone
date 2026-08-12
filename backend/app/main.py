@@ -671,6 +671,8 @@ async def chat_review_generate_test(
         first_alert=body.first_alert.model_dump() if body.first_alert else None,
         overall_drift=body.overall_drift,
         tips=body.tips,
+        transcript=body.transcript,
+        timeline=[p.model_dump() for p in body.timeline],
     )
     return ChatReviewGenerateTestOut(code=code)
 

@@ -9,7 +9,6 @@ from typing import Any, Callable, Optional
 import httpx
 
 from llmtest.assertions import AssertionResult, SemanticAssertionError
-from llmtest.embedder import get_embedder
 
 
 TestFn = Callable[..., Any]
