@@ -640,6 +640,21 @@ async def chat_review(
             if llm_tips:
                 result["tips"] = llm_tips
                 tips_source = "llm"
+            # else keep rule tips already on result
+        # Drop generic LLM filler if the model ignored instructions
+        filtered = chat_review_mod.filter_assertion_tips(result.get("tips") or [])
+        if filtered:
+            result["tips"] = filtered
+        elif tips_source == "llm":
+            # fall back to heuristics when LLM tips were unusable
+            result["tips"] = chat_review_mod.rule_tips(
+                goal=goal,
+                peak_label=str((result.get("peak") or {}).get("label") or "n/a"),
+                peak_score=float((result.get("peak") or {}).get("drift_score") or 0),
+                peak_excerpt=str((result.get("peak") or {}).get("excerpt") or ""),
+                overall=float(result["overall_drift"]),
+            )
+            tips_source = "rules"
 
     result["tips_source"] = tips_source
     return ChatReviewOut(

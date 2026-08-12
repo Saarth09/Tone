@@ -265,6 +265,53 @@ def rule_tips(
     return tips[:6]
 
 
+_ASSERT_TIP_NAMES = (
+    "assert_semantically_equals",
+    "assert_tone_matches",
+    "assert_semantically_excludes",
+)
+_BAD_TIP_RE = re.compile(
+    r"(?i)\b("
+    r"benefits of using ai|risks of using ai|casual summary|solicit feedback|"
+    r"clarify your focus|key benefits|reinforce the value|marketing"
+    r")\b"
+)
+
+
+def _split_tip_blob(text: str) -> list[str]:
+    """Split one mega tip paragraph into separate tips when the model ignores newlines."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) < 220:
+        return [text]
+    parts = re.split(
+        r"(?<=[.!?])\s+(?=(?:"
+        r"Use |Apply |Implement |Another |Additionally |Finally |If |"
+        r"Pin |Add |Lock "
+        r"))",
+        text,
+    )
+    if len(parts) == 1:
+        parts = re.split(r"(?<=[.!?])\s+", text)
+    return [p.strip() for p in parts if len(p.strip()) >= 40]
+
+
+def filter_assertion_tips(tips: Optional[list[str]]) -> list[str]:
+    """Keep only tips that name an llmtest assertion and aren't generic filler."""
+    out: list[str] = []
+    for tip in tips or []:
+        for chunk in _split_tip_blob(tip):
+            if _BAD_TIP_RE.search(chunk):
+                continue
+            if not any(name in chunk for name in _ASSERT_TIP_NAMES):
+                continue
+            out.append(chunk)
+            if len(out) >= 4:
+                return out
+    return out
+
+
 async def maybe_llm_tips(
     *,
     llm_complete,
@@ -277,13 +324,14 @@ async def maybe_llm_tips(
     if llm_complete is None:
         return None
     prompt = (
-        "You write tips for developers pinning AI behavior with llmtest assertions.\n"
-        "Return 3-4 tips as plain sentences (no markdown, no numbering).\n"
-        "Each tip MUST: (1) name a concrete failure mode from this chat, "
-        "(2) name exactly one of assert_semantically_equals / assert_tone_matches / "
-        "assert_semantically_excludes, and (3) suggest a SHORT realistic user query "
-        "a customer would type (not a project essay).\n"
-        "Do NOT give marketing advice. Do NOT say 'clarify your focus' or 'solicit feedback'.\n\n"
+        "You write tips for developers pinning THIS chat's AI behavior with llmtest.\n"
+        "Return exactly 3 tips, each on its own line (no markdown, no numbering).\n"
+        "Each tip MUST include ALL of:\n"
+        "  - a failure mode visible in THIS transcript (not generic AI advice)\n"
+        "  - exactly one of: assert_semantically_equals | assert_tone_matches | assert_semantically_excludes\n"
+        "  - a SHORT probe a real user would type (under 12 words), quoted\n"
+        "Forbidden: marketing language, 'benefits of AI', 'risks of AI', 'casual summary', "
+        "'clarify your focus', 'solicit feedback', or tips unrelated to the goal below.\n\n"
         f"ORIGINAL GOAL:\n{goal[:1500]}\n\n"
         f"OVERALL DRIFT SCORE: {overall:.2f} (0=on track, 1=fully drifted)\n"
         f"PEAK LOCATION: {peak_label} (score {peak_score:.2f})\n"
@@ -295,12 +343,13 @@ async def maybe_llm_tips(
     except Exception:
         logger.exception("LLM tips failed")
         return None
-    lines = []
+    lines: list[str] = []
     for line in (text or "").splitlines():
         cleaned = re.sub(r"^[\-\*\d\.\)\s]+", "", line).strip()
         if cleaned:
             lines.append(cleaned)
-    return lines[:6] or None
+    filtered = filter_assertion_tips(lines)
+    return filtered or None
 
 
 def analyze_turns(
@@ -405,7 +454,17 @@ def _user_assistant_pairs(turns: list[Turn]) -> list[dict[str, Any]]:
     return pairs
 
 
-def _short_probe(user_text: str, goal: str, *, max_len: int = 140) -> str:
+def _role_from_excerpt(excerpt: str, role: str) -> str:
+    """Pull `user:` / `assistant:` body from a window excerpt."""
+    role_l = role.lower()
+    for line in (excerpt or "").split("\n"):
+        stripped = line.strip()
+        if stripped.lower().startswith(f"{role_l}:"):
+            return _clean(stripped.split(":", 1)[-1])
+    return ""
+
+
+def _short_probe(user_text: str, goal: str, *, max_len: int = 100) -> str:
     """
     Turn a (possibly long) user message into a short, realistic suite.query(...) probe.
     Prefer the actual ask / last question over dumping the whole brief.
@@ -426,18 +485,18 @@ def _short_probe(user_text: str, goal: str, *, max_len: int = 140) -> str:
 
     for candidate in reversed(candidates):
         if len(candidate) >= 12:
-            return candidate[: max_len - 1] + ("…" if len(candidate) > max_len else "")
+            return _polish_probe(candidate, max_len=max_len)
 
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     for s in reversed(sentences):
         if "?" in s and len(s) >= 12:
-            return s[: max_len - 1] + ("…" if len(s) > max_len else "")
+            return _polish_probe(s, max_len=max_len)
 
     paras = [p.strip() for p in re.split(r"\n\s*\n", user_text) if p.strip()]
     if paras:
         last = _clean(paras[-1])
         if len(last) >= 12:
-            return last[: max_len - 1] + ("…" if len(last) > max_len else "")
+            return _polish_probe(last, max_len=max_len)
 
     if len(text) <= max_len:
         return text
@@ -445,6 +504,22 @@ def _short_probe(user_text: str, goal: str, *, max_len: int = 140) -> str:
     if 20 <= len(g) <= max_len:
         return g
     return text[: max_len - 1] + "…"
+
+
+def _polish_probe(probe: str, *, max_len: int = 100) -> str:
+    """Normalize awkward extracted asks into short CI probes."""
+    p = _clean(probe)
+    m = re.match(r"(?i)^expand upon this\s+(?:as\s+)?(.+)$", p)
+    if m:
+        rest = _clean(m.group(1))
+        # Prefer domain keywords if present
+        if re.search(r"(?i)\b(tone|llmtest|drift|chat)\b", rest):
+            p = "Expand on how Tone chat-review drift should feed llmtest"
+        else:
+            p = f"Expand on this: {rest}"
+    if len(p) > max_len:
+        return p[: max_len - 1] + "…"
+    return p
 
 
 def _first_sentences(text: str, *, n: int = 2, max_len: int = 280) -> str:
@@ -455,10 +530,22 @@ def _first_sentences(text: str, *, n: int = 2, max_len: int = 280) -> str:
     return joined
 
 
-def _gold_baseline(assistant: str, goal: str, *, drifted: bool) -> str:
-    """Expected reply: use a good assistant answer when on-track; else goal-locked gold."""
-    if not drifted and assistant and len(_clean(assistant)) >= 40:
-        return _first_sentences(assistant, n=2, max_len=280)
+def _gold_baseline(
+    assistant: str,
+    goal: str,
+    *,
+    drifted: bool,
+    overall_drift: float = 0.0,
+) -> str:
+    """
+    Expected reply for assert_semantically_equals.
+    On-track chats: use the real assistant answer (gold from observation).
+    Drifted chats / missing reply: goal-locked placeholder the author should edit.
+    """
+    asst = _clean(assistant)
+    # Prefer observed good answers whenever overall drift is below alert territory
+    if asst and len(asst) >= 40 and (overall_drift < 0.45 or not drifted):
+        return _first_sentences(asst, n=2, max_len=280)
     g = _clean(goal)
     short = g if len(g) <= 180 else g[:179] + "…"
     return (
@@ -489,11 +576,22 @@ def _pick_cases(
             continue
 
     peak_start = None
+    peak_assistant = _role_from_excerpt(str((peak or {}).get("excerpt") or ""), "assistant")
     if peak:
         try:
             peak_start = int(peak.get("window_start"))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             peak_start = None
+
+    # If pairing missed the assistant, salvage from timeline excerpts
+    if pairs and not any(_clean(str(p.get("assistant") or "")) for p in pairs):
+        for point in timeline or []:
+            salvaged = _role_from_excerpt(str(point.get("excerpt") or ""), "assistant")
+            if len(salvaged) >= 40:
+                pairs[0]["assistant"] = salvaged
+                break
+        if not _clean(str(pairs[0].get("assistant") or "")) and len(peak_assistant) >= 40:
+            pairs[0]["assistant"] = peak_assistant
 
     enriched: list[dict[str, Any]] = []
     for pair in pairs:
@@ -515,13 +613,15 @@ def _pick_cases(
         if key in seen_probes:
             continue
         seen_probes.add(key)
+        asst = str(pair.get("assistant") or "") or peak_assistant
         cases.append(
             {
                 "probe": probe,
                 "baseline": _gold_baseline(
-                    str(pair.get("assistant") or ""),
+                    asst,
                     goal,
                     drifted=bool(pair["drifted"]),
+                    overall_drift=overall_drift,
                 ),
                 "drifted": bool(pair["drifted"]),
                 "drift": float(pair["drift"]),
@@ -535,29 +635,22 @@ def _pick_cases(
         cases.append(
             {
                 "probe": probe,
-                "baseline": _gold_baseline("", goal, drifted=overall_drift >= 0.35),
+                "baseline": _gold_baseline(
+                    peak_assistant,
+                    goal,
+                    drifted=overall_drift >= 0.35,
+                    overall_drift=overall_drift,
+                ),
                 "drifted": overall_drift >= 0.35,
                 "drift": overall_drift,
             }
         )
 
-    # Ensure we have a warm/angry-style tone probe when only one exchange exists
+    # Ensure we have tone/excludes variants when only one exchange exists
     if len(cases) == 1:
         base = cases[0]
-        cases.append(
-            {
-                **base,
-                "probe": base["probe"],
-                "kind": "tone",
-            }
-        )
-        cases.append(
-            {
-                **base,
-                "probe": base["probe"],
-                "kind": "excludes",
-            }
-        )
+        cases.append({**base, "probe": base["probe"], "kind": "tone"})
+        cases.append({**base, "probe": base["probe"], "kind": "excludes"})
     return cases
 
 
@@ -618,9 +711,20 @@ def generate_llmtest_stub(
         else "helpful, focused, and faithful to the user's stated requirements"
     )
 
+    usable_tips = filter_assertion_tips(tips)
+    if not usable_tips:
+        usable_tips = filter_assertion_tips(
+            rule_tips(
+                goal=goal,
+                peak_label=peak_label or "n/a",
+                peak_score=float(peak_score or overall_drift),
+                peak_excerpt=str(focus.get("excerpt") or ""),
+                overall=overall_drift,
+            )
+        )
     tip_comment = ""
-    if tips:
-        tip_comment = "\n".join(f"# - {t}" for t in tips[:3])
+    if usable_tips:
+        tip_comment = "\n".join(f"# - {t}" for t in usable_tips[:3])
         tip_comment = f"\n# Assertion tips from Tone:\n{tip_comment}\n"
 
     name = _suite_name(goal)
@@ -646,7 +750,7 @@ suite = LLMTestSuite(
 
 @suite.test
 def test_response_matches_expected_meaning():
-    response = suite.query("{_py_str(str(equals_case['probe']), 160)}")
+    response = suite.query("{_py_str(str(equals_case['probe']), 120)}")
     assert_semantically_equals(
         response,
         baseline="{_py_str(str(equals_case['baseline']), 280)}",
@@ -656,7 +760,7 @@ def test_response_matches_expected_meaning():
 
 @suite.test
 def test_tone_stays_on_task():
-    response = suite.query("{_py_str(str(tone_case['probe']), 160)}")
+    response = suite.query("{_py_str(str(tone_case['probe']), 120)}")
     assert_tone_matches(
         response,
         persona="{_py_str(persona, 120)}",
@@ -666,7 +770,7 @@ def test_tone_stays_on_task():
 
 @suite.test
 def test_does_not_abandon_goal():
-    response = suite.query("{_py_str(str(excl_case['probe']), 160)}")
+    response = suite.query("{_py_str(str(excl_case['probe']), 120)}")
     assert_semantically_excludes(
         response,
         concept="{_py_str(forbidden, 200)}",
