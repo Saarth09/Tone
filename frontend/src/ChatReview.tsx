@@ -104,7 +104,7 @@ export default function ChatReview() {
             </label>
             <button
               type="button"
-              className="btn ghost"
+              className="btn"
               onClick={() => {
                 setTranscript(EXAMPLE);
                 setGoal("");
