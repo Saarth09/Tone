@@ -118,6 +118,32 @@ export type Explainability = {
   total_explained?: number;
 };
 
+export type ChatReviewPoint = {
+  turn_index: number;
+  window_start: number;
+  window_end: number;
+  label: string;
+  drift_score: number;
+  similarity: number;
+  is_alert: boolean;
+  excerpt: string;
+};
+
+export type ChatReviewResult = {
+  goal: string;
+  message_count: number;
+  assistant_turns: number;
+  user_turns: number;
+  threshold: number;
+  overall_drift: number;
+  is_alert: boolean;
+  peak: ChatReviewPoint | null;
+  first_alert: ChatReviewPoint | null;
+  timeline: ChatReviewPoint[];
+  tips: string[];
+  tips_source: string;
+};
+
 export type Alert = {
   id: number;
   category: string;
@@ -216,4 +242,14 @@ export const api = {
       "/api/connection/test",
       { method: "POST", body: JSON.stringify(body) }
     ),
+  chatReview: (body: {
+    transcript: string;
+    goal?: string;
+    threshold?: number;
+    use_llm_tips?: boolean;
+  }) =>
+    request<ChatReviewResult>("/api/chat-review", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };

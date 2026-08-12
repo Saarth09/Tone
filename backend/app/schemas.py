@@ -180,3 +180,43 @@ class UserOut(BaseModel):
     auth_provider: str = "password"
 
     model_config = {"from_attributes": True}
+
+
+class ChatReviewIn(BaseModel):
+    transcript: str = Field(..., min_length=20, description="Plain transcript or ChatGPT export JSON")
+    goal: Optional[str] = Field(
+        default=None,
+        description="Optional original goal; defaults to the first user message",
+    )
+    threshold: float = Field(default=0.45, ge=0.05, le=0.95)
+    use_llm_tips: bool = Field(
+        default=True,
+        description="If true and an LLM is connected, refine tips with that model",
+    )
+
+
+class ChatReviewPoint(BaseModel):
+    turn_index: int
+    window_start: int
+    window_end: int
+    label: str
+    drift_score: float
+    similarity: float
+    is_alert: bool
+    excerpt: str
+
+
+class ChatReviewOut(BaseModel):
+    goal: str
+    message_count: int
+    assistant_turns: int
+    user_turns: int
+    threshold: float
+    overall_drift: float
+    is_alert: bool
+    peak: Optional[ChatReviewPoint] = None
+    first_alert: Optional[ChatReviewPoint] = None
+    timeline: list[ChatReviewPoint]
+    tips: list[str]
+    tips_source: str = "rules"
+

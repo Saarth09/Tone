@@ -26,6 +26,7 @@ import {
 import AuthScreen from "./AuthScreen";
 import AccountMenu from "./AccountMenu";
 import ConnectLLM from "./ConnectLLM";
+import ChatReview from "./ChatReview";
 
 function fmtTime(iso: string) {
   const d = new Date(iso);
@@ -64,6 +65,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<"monitor" | "chat">("monitor");
   const watchingRef = useRef<string | null>(null);
 
   const refreshHeavy = useCallback(async () => {
@@ -302,6 +304,27 @@ export default function App() {
           Behavioral drift detector for LLM outputs — continuous probe sampling,
           embedding-space MMD, token KL divergence, and persona cosine checks.
         </p>
+        <div className="app-tabs" role="tablist" aria-label="Tone sections">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "monitor"}
+            className={`app-tab ${tab === "monitor" ? "active" : ""}`}
+            onClick={() => setTab("monitor")}
+          >
+            Monitor
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "chat"}
+            className={`app-tab ${tab === "chat" ? "active" : ""}`}
+            onClick={() => setTab("chat")}
+          >
+            Chat review
+          </button>
+        </div>
+        {tab === "monitor" && (
         <div className="toolbar">
           <span className={`pill ${alertActive ? "danger" : status?.drifted || status?.system_prompt_poisoned ? "warn" : ""}`}>
             <span className="dot" />
@@ -407,7 +430,8 @@ export default function App() {
             </>
           )}
         </div>
-        {busy && busyLabel && (
+        )}
+        {tab === "monitor" && busy && busyLabel && (
           <div className="busy-banner" role="status" aria-live="polite">
             <span className="spinner" aria-hidden="true" />
             <div>
@@ -419,9 +443,13 @@ export default function App() {
             </div>
           </div>
         )}
-        {error && <p className="error">{error}</p>}
+        {tab === "monitor" && error && <p className="error">{error}</p>}
       </header>
 
+      {tab === "chat" ? (
+        <ChatReview />
+      ) : (
+      <>
       {!status?.demo_mode && <ConnectLLM onSaved={refresh} />}
 
       <section className="grid stats">
@@ -593,6 +621,8 @@ export default function App() {
           </div>
         </div>
       </section>
+      </>
+      )}
     </div>
   );
 }

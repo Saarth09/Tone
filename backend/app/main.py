@@ -29,6 +29,9 @@ from app.scheduler import JobRunner
 from app.schemas import (
     AlertOut,
     BaselineRequest,
+    ChatReviewIn,
+    ChatReviewOut,
+    ChatReviewPoint,
     CompareOut,
     DriftScoreOut,
     DriftSimulateRequest,
@@ -46,6 +49,7 @@ from app.schemas import (
     UserOut,
 )
 from app.security import decrypt_secret
+from app import chat_review as chat_review_mod
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
@@ -578,3 +582,75 @@ async def test_connection(
         await session.commit()
 
     return LLMConnectionTestOut(ok=ok, message=message, latency_ms=latency)
+
+
+@app.post("/api/chat-review", response_model=ChatReviewOut)
+async def chat_review(
+    body: ChatReviewIn,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """Analyze a pasted transcript / export for goal drift along the conversation."""
+    assert embedder is not None and sampler is not None
+
+    turns = chat_review_mod.parse_transcript(body.transcript)
+    if len(turns) < 2:
+        raise HTTPException(
+            400,
+            "Could not parse enough messages. Use User:/Assistant: labels, blank-line "
+            "alternating turns, or a ChatGPT export JSON.",
+        )
+
+    goal = chat_review_mod.infer_goal(turns, body.goal)
+    if not goal:
+        raise HTTPException(400, "Could not infer an original goal. Provide the goal field.")
+
+    def _embed(texts: list[str]):
+        return embedder.embed(texts)
+
+    result = await asyncio.to_thread(
+        chat_review_mod.analyze_turns,
+        turns,
+        embed_fn=_embed,
+        goal=goal,
+        threshold=body.threshold,
+    )
+
+    tips_source = "rules"
+    if body.use_llm_tips:
+        await connections.load_user(session, user.id)
+        cfg = connections.live_for(user.id)
+        if cfg.api_key or settings.demo_mode:
+            sampler._bind_user_llm(user.id)
+
+            async def _complete(prompt: str):
+                return await sampler.llm.complete(prompt)
+
+            peak = result.get("peak") or {}
+            llm_tips = await chat_review_mod.maybe_llm_tips(
+                llm_complete=_complete,
+                goal=goal,
+                peak_label=str(peak.get("label") or "n/a"),
+                peak_score=float(peak.get("drift_score") or 0),
+                peak_excerpt=str(peak.get("excerpt") or ""),
+                overall=float(result["overall_drift"]),
+            )
+            if llm_tips:
+                result["tips"] = llm_tips
+                tips_source = "llm"
+
+    result["tips_source"] = tips_source
+    return ChatReviewOut(
+        goal=result["goal"],
+        message_count=result["message_count"],
+        assistant_turns=result["assistant_turns"],
+        user_turns=result["user_turns"],
+        threshold=result["threshold"],
+        overall_drift=result["overall_drift"],
+        is_alert=result["is_alert"],
+        peak=ChatReviewPoint(**result["peak"]) if result.get("peak") else None,
+        first_alert=ChatReviewPoint(**result["first_alert"]) if result.get("first_alert") else None,
+        timeline=[ChatReviewPoint(**p) for p in result["timeline"]],
+        tips=result["tips"],
+        tips_source=tips_source,
+    )
