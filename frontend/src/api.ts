@@ -127,6 +127,8 @@ export type ChatReviewPoint = {
   similarity: number;
   is_alert: boolean;
   excerpt: string;
+  user_text?: string;
+  assistant_text?: string;
 };
 
 export type ChatReviewResult = {

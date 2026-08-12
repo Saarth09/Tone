@@ -195,21 +195,28 @@ def infer_goal(turns: list[Turn], explicit: Optional[str] = None) -> str:
     return turns[0].content[:2000] if turns else ""
 
 
-def _window_texts(turns: list[Turn]) -> list[tuple[int, int, str, str]]:
-    """Build analysis windows over assistant turns."""
+def _window_texts(turns: list[Turn]) -> list[tuple[int, int, str, str, str, str]]:
+    """
+    Build analysis windows over assistant turns.
+    Returns (start, end, label, embed_text, user_text, assistant_text).
+    """
     assistant_idxs = [i for i, t in enumerate(turns) if t.role == "assistant"]
     if not assistant_idxs:
-        return [(0, max(0, len(turns) - 1), "full transcript", "\n".join(t.content for t in turns))]
+        blob = "\n".join(t.content for t in turns)
+        return [(0, max(0, len(turns) - 1), "full transcript", blob, blob, "")]
 
-    windows: list[tuple[int, int, str, str]] = []
+    windows: list[tuple[int, int, str, str, str, str]] = []
     for n, a_idx in enumerate(assistant_idxs):
         start = a_idx
+        user_text = ""
         if a_idx > 0 and turns[a_idx - 1].role == "user":
             start = a_idx - 1
+            user_text = turns[a_idx - 1].content
+        assistant_text = turns[a_idx].content
         chunk = turns[start : a_idx + 1]
         text = "\n".join(f"{t.role}: {t.content}" for t in chunk)
         label = f"Exchange {n + 1} (msgs {start + 1}–{a_idx + 1})"
-        windows.append((start, a_idx, label, text))
+        windows.append((start, a_idx, label, text, user_text, assistant_text))
     return windows
 
 
@@ -273,7 +280,8 @@ _ASSERT_TIP_NAMES = (
 _BAD_TIP_RE = re.compile(
     r"(?i)\b("
     r"benefits of using ai|risks of using ai|casual summary|solicit feedback|"
-    r"clarify your focus|key benefits|reinforce the value|marketing"
+    r"clarify your focus|key benefits|reinforce the value|marketing|"
+    r"explain it like i'?m five|how this works simply|core functionality as described"
     r")\b"
 )
 
@@ -372,7 +380,7 @@ def analyze_turns(
     win_vecs = vectors[1:]
 
     points: list[dict[str, Any]] = []
-    for (start, end, label, text), vec in zip(windows, win_vecs):
+    for (start, end, label, text, user_text, assistant_text), vec in zip(windows, win_vecs):
         sim = cosine_similarity(goal_vec, vec)
         score = drift_from_similarity(sim)
         points.append(
@@ -385,6 +393,8 @@ def analyze_turns(
                 "similarity": round(float(sim), 4),
                 "is_alert": bool(score >= threshold),
                 "excerpt": text[:320] + ("…" if len(text) > 320 else ""),
+                "user_text": (user_text or "")[:800],
+                "assistant_text": (assistant_text or "")[:800],
             }
         )
 
@@ -576,25 +586,64 @@ def _pick_cases(
             continue
 
     peak_start = None
-    peak_assistant = _role_from_excerpt(str((peak or {}).get("excerpt") or ""), "assistant")
+    peak_assistant = _clean(str((peak or {}).get("assistant_text") or ""))
+    if not peak_assistant:
+        peak_assistant = _role_from_excerpt(str((peak or {}).get("excerpt") or ""), "assistant")
+    peak_user = _clean(str((peak or {}).get("user_text") or ""))
+    if not peak_user:
+        peak_user = _role_from_excerpt(str((peak or {}).get("excerpt") or ""), "user")
     if peak:
         try:
             peak_start = int(peak.get("window_start"))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             peak_start = None
 
-    # If pairing missed the assistant, salvage from timeline excerpts
-    if pairs and not any(_clean(str(p.get("assistant") or "")) for p in pairs):
-        for point in timeline or []:
-            salvaged = _role_from_excerpt(str(point.get("excerpt") or ""), "assistant")
-            if len(salvaged) >= 40:
-                pairs[0]["assistant"] = salvaged
-                break
-        if not _clean(str(pairs[0].get("assistant") or "")) and len(peak_assistant) >= 40:
-            pairs[0]["assistant"] = peak_assistant
+    # Prefer structured timeline fields (survive long user prompts that truncate excerpts)
+    timeline_pairs: list[dict[str, Any]] = []
+    for point in timeline or []:
+        u = _clean(str(point.get("user_text") or ""))
+        a = _clean(str(point.get("assistant_text") or ""))
+        if not u and not a:
+            continue
+        try:
+            ws = int(point["window_start"])
+            we = int(point.get("window_end", ws))
+        except (KeyError, TypeError, ValueError):
+            ws, we = 0, 0
+        timeline_pairs.append(
+            {
+                "user": u or peak_user or goal,
+                "assistant": a,
+                "window_start": ws,
+                "window_end": we,
+            }
+        )
+
+    # Merge: timeline structured pairs first, then transcript pairs as backup
+    merged: list[dict[str, Any]] = timeline_pairs if timeline_pairs else list(pairs)
+    if not merged and (peak_user or peak_assistant):
+        merged = [
+            {
+                "user": peak_user or goal,
+                "assistant": peak_assistant,
+                "window_start": peak_start or 0,
+                "window_end": peak_start or 0,
+            }
+        ]
+
+    # If transcript pairs have richer assistant text, fill gaps
+    by_start = {int(p["window_start"]): p for p in pairs}
+    for item in merged:
+        src = by_start.get(int(item["window_start"]))
+        if src and len(_clean(str(src.get("assistant") or ""))) > len(_clean(str(item.get("assistant") or ""))):
+            item["assistant"] = src["assistant"]
+        if src and len(_clean(str(src.get("user") or ""))) > len(_clean(str(item.get("user") or ""))):
+            item["user"] = src["user"]
+        if not _clean(str(item.get("assistant") or "")) and peak_assistant:
+            item["assistant"] = peak_assistant
 
     enriched: list[dict[str, Any]] = []
-    for pair in pairs:
+    for pair in merged:
         d = drift_by_start.get(int(pair["window_start"]), overall_drift)
         enriched.append({**pair, "drift": d, "drifted": d >= 0.35})
 
@@ -631,7 +680,7 @@ def _pick_cases(
             break
 
     if not cases:
-        probe = _short_probe(goal, goal)
+        probe = _short_probe(peak_user or goal, goal)
         cases.append(
             {
                 "probe": probe,
@@ -646,7 +695,6 @@ def _pick_cases(
             }
         )
 
-    # Ensure we have tone/excludes variants when only one exchange exists
     if len(cases) == 1:
         base = cases[0]
         cases.append({**base, "probe": base["probe"], "kind": "tone"})

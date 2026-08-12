@@ -204,6 +204,8 @@ class ChatReviewPoint(BaseModel):
     similarity: float
     is_alert: bool
     excerpt: str
+    user_text: str = ""
+    assistant_text: str = ""
 
 
 class ChatReviewOut(BaseModel):
