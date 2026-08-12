@@ -1,0 +1,39 @@
+# Example — copy into your app repo (or keep here for Tone itself).
+# name: LLM Behavioral Tests
+#
+# on:
+#   pull_request:
+#
+# jobs:
+#   llmtest:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - name: Run LLM behavioral test suite
+#         uses: ./.github/actions/llmtest
+#         with:
+#           test-dir: packages/llmtest/examples
+#           package-path: packages/llmtest
+#           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+#           fail-on-drift: true
+#           drift-threshold: "0.80"
+
+name: LLM Behavioral Tests (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  llmtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run LLM behavioral test suite
+        uses: ./.github/actions/llmtest
+        with:
+          test-dir: packages/llmtest/examples
+          package-path: packages/llmtest
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          fail-on-drift: "true"
+          drift-threshold: "0.80"
+          model: gpt-4o-mini

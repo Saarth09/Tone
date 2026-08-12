@@ -1,0 +1,63 @@
+name: llmtest
+description: Run semantic LLM behavioral regression tests (pytest for AI behavior)
+inputs:
+  test-dir:
+    description: Directory with test_*.py LLMTestSuite files
+    required: false
+    default: llmtests
+  openai-api-key:
+    description: API key for OpenAI-compatible chat completions
+    required: true
+  fail-on-drift:
+    description: Fail the job when any behavioral test fails
+    required: false
+    default: "true"
+  drift-threshold:
+    description: Cosine similarity floor for baseline comparisons
+    required: false
+    default: "0.80"
+  model:
+    description: Optional model override (sets LLM_MODEL)
+    required: false
+    default: ""
+  base-url:
+    description: Optional OpenAI-compatible base URL
+    required: false
+    default: "https://api.openai.com/v1"
+  package-path:
+    description: Path to the llmtest package in the repo
+    required: false
+    default: packages/llmtest
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install llmtest
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install -e "${{ inputs.package-path }}"
+
+    - name: Run behavioral tests
+      shell: bash
+      env:
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        LLM_BASE_URL: ${{ inputs.base-url }}
+        LLM_MODEL: ${{ inputs.model }}
+      run: |
+        EXTRA=()
+        if [ "${{ inputs.fail-on-drift }}" = "true" ]; then
+          EXTRA+=(--fail-on-drift)
+        else
+          EXTRA+=(--no-fail-on-drift)
+        fi
+        if [ -n "${{ inputs.drift-threshold }}" ]; then
+          EXTRA+=(--drift-threshold "${{ inputs.drift-threshold }}")
+        fi
+        llmtest run --test-dir "${{ inputs.test-dir }}" --markdown "${EXTRA[@]}"

@@ -24,6 +24,9 @@ export default function ChatReview() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ChatReviewResult | null>(null);
+  const [generatedCode, setGeneratedCode] = useState<string | null>(null);
+  const [genBusy, setGenBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const chartData = useMemo(
     () =>
@@ -47,6 +50,8 @@ export default function ChatReview() {
         use_llm_tips: true,
       });
       setResult(out);
+      setGeneratedCode(null);
+      setCopied(false);
     } catch (err) {
       setResult(null);
       setError(err instanceof Error ? err.message : "Analysis failed");
@@ -210,8 +215,63 @@ export default function ChatReview() {
                   <li key={tip.slice(0, 48)}>{tip}</li>
                 ))}
               </ol>
+              <div className="row-actions" style={{ marginTop: "1rem" }}>
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={genBusy}
+                  onClick={async () => {
+                    setGenBusy(true);
+                    setError(null);
+                    try {
+                      const out = await api.generateLlmTest({
+                        goal: result.goal,
+                        overall_drift: result.overall_drift,
+                        tips: result.tips,
+                        peak: result.peak,
+                        first_alert: result.first_alert,
+                      });
+                      setGeneratedCode(out.code);
+                      setCopied(false);
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : "Generate failed");
+                    } finally {
+                      setGenBusy(false);
+                    }
+                  }}
+                >
+                  {genBusy ? "Generating…" : "Generate llmtest"}
+                </button>
+              </div>
             </section>
           </div>
+
+          {generatedCode && (
+            <section className="panel">
+              <h2>llmtest suite</h2>
+              <p className="muted" style={{ marginTop: 0 }}>
+                Paste into <code>llmtests/</code> and run{" "}
+                <code>llmtest --baseline</code> then <code>llmtest run</code> in CI.
+              </p>
+              <pre className="code-block">{generatedCode}</pre>
+              <div className="row-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(generatedCode);
+                      setCopied(true);
+                    } catch {
+                      setCopied(false);
+                    }
+                  }}
+                >
+                  {copied ? "Copied" : "Copy to clipboard"}
+                </button>
+              </div>
+            </section>
+          )}
 
           <section className="panel">
             <h2>Exchange breakdown</h2>

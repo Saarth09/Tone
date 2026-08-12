@@ -252,4 +252,15 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  generateLlmTest: (body: {
+    goal: string;
+    overall_drift: number;
+    tips: string[];
+    peak?: ChatReviewPoint | null;
+    first_alert?: ChatReviewPoint | null;
+  }) =>
+    request<{ code: string; filename_hint: string }>("/api/chat-review/generate-test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };

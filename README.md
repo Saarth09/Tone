@@ -180,6 +180,37 @@ Weights and per-category thresholds are configurable via env (`MMD_WEIGHT`, `TON
 | GET | `/api/heatmap` | Per-probe drift cells |
 | GET | `/api/explainability` | PCA dimension deltas |
 | POST | `/api/demo/drift` | Toggle synthetic corruption |
+| POST | `/api/chat-review` | Goal-drift analysis on a pasted transcript |
+| POST | `/api/chat-review/generate-test` | Export an `llmtest` suite stub from review results |
+
+## llmtest — semantic regression testing (CI)
+
+**pytest for AI behavior.** Ship behavioral assertions that check *meaning*, not string equality. Package lives at [`packages/llmtest`](packages/llmtest).
+
+```bash
+pip install -e packages/llmtest
+export OPENAI_API_KEY=sk-...
+
+# write tests under llmtests/ (see packages/llmtest/examples)
+llmtest --baseline --test-dir packages/llmtest/examples
+llmtest run --test-dir packages/llmtest/examples
+```
+
+Assertions: `assert_semantically_equals`, `assert_tone_matches`, `assert_semantically_excludes`.
+
+GitHub Action (composite): [`.github/actions/llmtest`](.github/actions/llmtest)
+
+```yaml
+- uses: ./.github/actions/llmtest
+  with:
+    test-dir: llmtests
+    package-path: packages/llmtest
+    openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+    fail-on-drift: true
+    drift-threshold: "0.80"
+```
+
+In the Tone **Chat review** tab, after analysis click **Generate llmtest** to copy a ready-to-paste suite from detected drift (production signal → CI prevention).
 
 ## Tests
 
@@ -191,4 +222,4 @@ pytest -q
 
 ## Stack
 
-Python · FastAPI · APScheduler · sentence-transformers · ChromaDB · scikit-learn · SQLite · React · Recharts · Docker Compose
+Python · FastAPI · APScheduler · sentence-transformers · ChromaDB · scikit-learn · SQLite · React · Recharts · Docker Compose · llmtest

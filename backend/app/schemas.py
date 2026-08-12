@@ -220,3 +220,17 @@ class ChatReviewOut(BaseModel):
     tips: list[str]
     tips_source: str = "rules"
 
+
+class ChatReviewGenerateTestIn(BaseModel):
+    goal: str
+    overall_drift: float = 0.0
+    tips: list[str] = Field(default_factory=list)
+    peak: Optional[ChatReviewPoint] = None
+    first_alert: Optional[ChatReviewPoint] = None
+
+
+class ChatReviewGenerateTestOut(BaseModel):
+    code: str
+    filename_hint: str = "test_tone_generated.py"
+
+

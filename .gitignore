@@ -12,3 +12,7 @@ frontend/dist/
 .DS_Store
 .idea/
 .vscode/
+.llmtest/baseline/**/*.tmp
+*.egg-info/
+packages/llmtest/**/*.egg-info/
+

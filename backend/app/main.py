@@ -29,6 +29,8 @@ from app.scheduler import JobRunner
 from app.schemas import (
     AlertOut,
     BaselineRequest,
+    ChatReviewGenerateTestIn,
+    ChatReviewGenerateTestOut,
     ChatReviewIn,
     ChatReviewOut,
     ChatReviewPoint,
@@ -654,3 +656,21 @@ async def chat_review(
         tips=result["tips"],
         tips_source=tips_source,
     )
+
+
+@app.post("/api/chat-review/generate-test", response_model=ChatReviewGenerateTestOut)
+async def chat_review_generate_test(
+    body: ChatReviewGenerateTestIn,
+    user: User = Depends(get_current_user),
+):
+    """Turn a chat-review result into a paste-ready llmtest suite."""
+    _ = user
+    code = chat_review_mod.generate_llmtest_stub(
+        goal=body.goal,
+        peak=body.peak.model_dump() if body.peak else None,
+        first_alert=body.first_alert.model_dump() if body.first_alert else None,
+        overall_drift=body.overall_drift,
+        tips=body.tips,
+    )
+    return ChatReviewGenerateTestOut(code=code)
+
