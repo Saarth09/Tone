@@ -783,6 +783,89 @@ def _pick_cases(
     return cases[:1] if cases else cases
 
 
+_OFFTOPIC_PROBE_RE = re.compile(
+    r"(?i)\b("
+    r"joke|weather|trivia|favorite color|writing skills|time management|"
+    r"healthy meal|feeling overwhelmed|random fact|quick question"
+    r")\b"
+)
+
+
+def _topic_tokens(*texts: str) -> set[str]:
+    stop = {
+        "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "is", "this",
+        "that", "you", "your", "how", "what", "can", "should", "i", "my", "me", "be", "as",
+        "it", "are", "do", "does", "did", "will", "would", "could", "about", "from", "into",
+        "than", "then", "them", "they", "have", "has", "had", "not", "but", "was", "were",
+        "using", "used", "use", "also", "just", "like", "some", "any", "all", "more",
+    }
+    toks: set[str] = set()
+    for t in texts:
+        for w in re.findall(r"[a-z0-9]{3,}", (t or "").lower()):
+            if w not in stop:
+                toks.add(w)
+    return toks
+
+
+def _token_overlap(a: set[str], b: set[str]) -> int:
+    if not a or not b:
+        return 0
+    n = len(a & b)
+    for x in a:
+        for y in b:
+            if x == y:
+                continue
+            if len(x) >= 4 and len(y) >= 4 and (x.startswith(y) or y.startswith(x)):
+                n += 1
+    return n
+
+
+def _probe_looks_valid(probe: str, topic: set[str]) -> bool:
+    p = _clean(probe)
+    if len(p) < 8 or len(p) > 140:
+        return False
+    if p.startswith("[") or p.startswith("{") or p.startswith("'") or p.startswith('"'):
+        return False
+    if p.count("'") + p.count('"') >= 4:
+        return False
+    if "," in p and p.count("?") >= 2:
+        return False
+    if _OFFTOPIC_PROBE_RE.search(p):
+        return False
+    if len(p.split()) > 18:
+        return False
+    pt = _topic_tokens(p)
+    # Must share topic with the chat when we have topic signal
+    if topic and _token_overlap(pt, topic) < 1:
+        return False
+    return True
+
+
+def validate_suite_parts(
+    parts: dict[str, str],
+    *,
+    goal: str,
+    seed_probe: str,
+    assistant: str,
+) -> bool:
+    """Reject LLM polish that wandered off-topic or returned list junk."""
+    topic = _topic_tokens(goal, seed_probe, assistant)
+    probes = [parts.get("probe_equals", ""), parts.get("probe_tone", ""), parts.get("probe_excludes", "")]
+    if len({_clean(p).lower() for p in probes}) < 3:
+        return False
+    for p in probes:
+        if not _probe_looks_valid(p, topic):
+            return False
+    bl = _clean(parts.get("baseline") or "")
+    if len(bl) < 20 or len(bl) > 220:
+        return False
+    if bl.startswith("[") or _OFFTOPIC_PROBE_RE.search(bl):
+        return False
+    if topic and _token_overlap(_topic_tokens(bl), topic) < 1:
+        return False
+    return True
+
+
 async def maybe_llm_suite_parts(
     *,
     llm_complete,
@@ -795,15 +878,16 @@ async def maybe_llm_suite_parts(
     if llm_complete is None:
         return None
     prompt = (
-        "Create llmtest suite materials. Return ONLY compact JSON with keys:\n"
-        '  "probe_equals", "probe_tone", "probe_excludes", "baseline"\n'
-        "Rules:\n"
-        "- Each probe is a DIFFERENT short user question (<15 words) a real user would type.\n"
-        "- Do not reuse the same probe thrice.\n"
-        "- baseline is ONE sentence (<=30 words) stating the intended meaning — "
-        "paraphrase, no markdown, no bullet list, do not paste the assistant transcript.\n\n"
+        "Create llmtest suite materials about the GOAL below. Return ONLY JSON:\n"
+        '{"probe_equals":"...","probe_tone":"...","probe_excludes":"...","baseline":"..."}\n'
+        "Hard rules:\n"
+        "- Each probe is ONE short question (<12 words) about the GOAL topic.\n"
+        "- Probes must be three DIFFERENT questions; never a JSON/Python list of questions.\n"
+        "- Never invent unrelated topics (jokes, weather, writing tips, meals, etc.).\n"
+        "- baseline: one sentence (<=25 words) paraphrasing the intended meaning from the notes.\n"
+        "- Stay on-topic with GOAL / SEED ASK / ASSISTANT NOTES.\n\n"
         f"GOAL:\n{goal[:900]}\n\n"
-        f"SEED ASK:\n{seed_probe[:200]}\n\n"
+        f"SEED ASK:\n{seed_probe[:240]}\n\n"
         f"ASSISTANT NOTES TO PARAPHRASE (do not copy):\n{assistant[:900]}\n\n"
         f"OVERALL DRIFT: {overall_drift:.2f}\n\n"
         "JSON:"
@@ -829,22 +913,31 @@ async def maybe_llm_suite_parts(
             return None
     if not isinstance(data, dict):
         return None
-    pe = _clean(str(data.get("probe_equals") or ""))
-    pt = _clean(str(data.get("probe_tone") or ""))
-    px = _clean(str(data.get("probe_excludes") or ""))
+
+    def _one_probe(val: Any) -> str:
+        # Model sometimes returns a list of questions — reject that shape.
+        if isinstance(val, list):
+            return ""
+        return _clean(str(val or ""))
+
+    pe = _one_probe(data.get("probe_equals"))
+    pt = _one_probe(data.get("probe_tone"))
+    px = _one_probe(data.get("probe_excludes"))
     bl = _clean(str(data.get("baseline") or ""))
     if not (pe and pt and px and bl):
         return None
-    if len({pe.lower(), pt.lower(), px.lower()}) < 3:
-        return None
-    if len(bl) > 220:
-        bl = bl[:219] + "…"
-    return {
+    parts = {
         "probe_equals": pe[:120],
         "probe_tone": pt[:120],
         "probe_excludes": px[:120],
-        "baseline": bl,
+        "baseline": bl[:220],
     }
+    if not validate_suite_parts(
+        parts, goal=goal, seed_probe=seed_probe, assistant=assistant
+    ):
+        logger.info("Discarding off-topic LLM suite polish; using heuristics")
+        return None
+    return parts
 
 
 def generate_llmtest_stub(
@@ -878,6 +971,14 @@ def generate_llmtest_stub(
     }
     assistant_src = str(seed.get("assistant") or focus.get("assistant_text") or "")
     seed_probe = str(seed.get("probe") or "")
+
+    if suite_parts and not validate_suite_parts(
+        suite_parts,
+        goal=goal,
+        seed_probe=seed_probe,
+        assistant=assistant_src,
+    ):
+        suite_parts = None
 
     if suite_parts:
         probe_equals = suite_parts["probe_equals"]
