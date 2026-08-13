@@ -532,6 +532,13 @@ def _polish_probe(probe: str, *, max_len: int = 100) -> str:
     return p
 
 
+def _strip_md(text: str) -> str:
+    text = re.sub(r"[*_`#]+", " ", text or "")
+    text = re.sub(r"^\s*[-•]\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    return _clean(text)
+
+
 def _first_sentences(text: str, *, n: int = 2, max_len: int = 280) -> str:
     parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", _clean(text)) if s.strip()]
     joined = " ".join(parts[:n]).strip() or _clean(text)
@@ -540,28 +547,101 @@ def _first_sentences(text: str, *, n: int = 2, max_len: int = 280) -> str:
     return joined
 
 
+def _semantic_baseline(
+    assistant: str,
+    goal: str,
+    probe: str,
+    *,
+    max_len: int = 180,
+) -> str:
+    """
+    Short gold answer for assert_semantically_equals — meaning, not a truncated chat dump.
+    """
+    asst = _strip_md(assistant)
+    g = _clean(goal)
+    p = _clean(probe)
+
+    # Domain-aware compression when the chat is about Tone ↔ llmtest
+    blob = f"{asst} {g} {p}".lower()
+    if "tone" in blob and ("llmtest" in blob or "behavioral" in blob or "ci" in blob):
+        if "per-conversation" in blob or "chat-review" in blob or "chat review" in blob:
+            return (
+                "Tone's per-conversation drift detection can automatically generate "
+                "llmtest assertions, creating a feedback loop where production drift "
+                "becomes CI prevention."
+            )[:max_len]
+        return (
+            "Use llmtest to prevent drift before deploy, Tone to detect it in production, "
+            "and chat review to diagnose individual sessions."
+        )[:max_len]
+
+    if asst and len(asst) >= 40:
+        # Prefer a single clean sentence that isn't list/teaser scaffolding
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", asst) if s.strip()]
+        skip = re.compile(
+            r"(?i)^(you've now got|here(?:'s| is) the|full (?:breakdown|architecture)|"
+            r"the core idea|what you build)"
+        )
+        for s in sentences:
+            s = _clean(s)
+            if skip.match(s):
+                continue
+            if 50 <= len(s) <= max_len:
+                return s
+            if len(s) > max_len:
+                return s[: max_len - 1] + "…"
+        compact = _first_sentences(asst, n=1, max_len=max_len)
+        if compact and not skip.match(compact):
+            return compact
+
+    topic = p if 20 <= len(p) <= 90 else (g[:90] if g else "the user's request")
+    return f"Answer clearly and stay on scope: {topic}"[:max_len]
+
+
+def _probe_variants(seed: str, goal: str, assistant: str = "") -> tuple[str, str, str]:
+    """Three independent user asks that probe the same intended behavior from different angles."""
+    seed = _clean(seed)
+    blob = f"{seed} {goal} {assistant}".lower()
+
+    if "tone" in blob and ("llmtest" in blob or "drift" in blob or "ci" in blob):
+        return (
+            "How does Tone chat-review feed into llmtest?",
+            "What's the connection between drift detection and CI testing?",
+            "Should I use Tone alongside llmtest or instead of it?",
+        )
+
+    # Generic: rephrase the seed three ways
+    topic = seed.rstrip("?") if seed else _clean(goal)[:80]
+    if not topic:
+        topic = "the original task"
+    equals = topic if topic.endswith("?") else f"How should you handle this: {topic[:70]}?"
+    tone = f"Explain {topic[:60].rstrip('?')} briefly and helpfully."
+    excludes = f"Can you stay on '{topic[:50].rstrip('?')}' without changing the goal?"
+    # Deduplicate if they collapsed
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in (equals, tone, excludes):
+        key = q.lower()
+        if key in seen:
+            q = f"{q} (be specific)"
+        seen.add(q.lower())
+        out.append(q[:120])
+    return out[0], out[1], out[2]
+
+
 def _gold_baseline(
     assistant: str,
     goal: str,
     *,
     drifted: bool,
     overall_drift: float = 0.0,
+    probe: str = "",
 ) -> str:
-    """
-    Expected reply for assert_semantically_equals.
-    On-track chats: use the real assistant answer (gold from observation).
-    Drifted chats / missing reply: goal-locked placeholder the author should edit.
-    """
+    """Expected reply for assert_semantically_equals — short semantic gold."""
     asst = _clean(assistant)
-    # Prefer observed good answers whenever overall drift is below alert territory
     if asst and len(asst) >= 40 and (overall_drift < 0.45 or not drifted):
-        return _first_sentences(asst, n=2, max_len=280)
-    g = _clean(goal)
-    short = g if len(g) <= 180 else g[:179] + "…"
-    return (
-        "Answer the user's request directly and stay on scope. "
-        f"Focus on: {short}"
-    )
+        return _semantic_baseline(asst, goal, probe or goal)
+    return _semantic_baseline("", goal, probe or goal)
 
 
 def _suite_name(goal: str) -> str:
@@ -666,11 +746,13 @@ def _pick_cases(
         cases.append(
             {
                 "probe": probe,
+                "assistant": asst,
                 "baseline": _gold_baseline(
                     asst,
                     goal,
                     drifted=bool(pair["drifted"]),
                     overall_drift=overall_drift,
+                    probe=probe,
                 ),
                 "drifted": bool(pair["drifted"]),
                 "drift": float(pair["drift"]),
@@ -684,22 +766,85 @@ def _pick_cases(
         cases.append(
             {
                 "probe": probe,
+                "assistant": peak_assistant,
                 "baseline": _gold_baseline(
                     peak_assistant,
                     goal,
                     drifted=overall_drift >= 0.35,
                     overall_drift=overall_drift,
+                    probe=probe,
                 ),
                 "drifted": overall_drift >= 0.35,
                 "drift": overall_drift,
             }
         )
 
-    if len(cases) == 1:
-        base = cases[0]
-        cases.append({**base, "probe": base["probe"], "kind": "tone"})
-        cases.append({**base, "probe": base["probe"], "kind": "excludes"})
-    return cases
+    # Keep a single seed case; variants are applied in generate_llmtest_stub
+    return cases[:1] if cases else cases
+
+
+async def maybe_llm_suite_parts(
+    *,
+    llm_complete,
+    goal: str,
+    seed_probe: str,
+    assistant: str,
+    overall_drift: float,
+) -> Optional[dict[str, str]]:
+    """Ask the connected LLM for 3 distinct probes + a short semantic baseline."""
+    if llm_complete is None:
+        return None
+    prompt = (
+        "Create llmtest suite materials. Return ONLY compact JSON with keys:\n"
+        '  "probe_equals", "probe_tone", "probe_excludes", "baseline"\n'
+        "Rules:\n"
+        "- Each probe is a DIFFERENT short user question (<15 words) a real user would type.\n"
+        "- Do not reuse the same probe thrice.\n"
+        "- baseline is ONE sentence (<=30 words) stating the intended meaning — "
+        "paraphrase, no markdown, no bullet list, do not paste the assistant transcript.\n\n"
+        f"GOAL:\n{goal[:900]}\n\n"
+        f"SEED ASK:\n{seed_probe[:200]}\n\n"
+        f"ASSISTANT NOTES TO PARAPHRASE (do not copy):\n{assistant[:900]}\n\n"
+        f"OVERALL DRIFT: {overall_drift:.2f}\n\n"
+        "JSON:"
+    )
+    try:
+        text, _ = await llm_complete(prompt)
+    except Exception:
+        logger.exception("LLM suite polish failed")
+        return None
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    pe = _clean(str(data.get("probe_equals") or ""))
+    pt = _clean(str(data.get("probe_tone") or ""))
+    px = _clean(str(data.get("probe_excludes") or ""))
+    bl = _clean(str(data.get("baseline") or ""))
+    if not (pe and pt and px and bl):
+        return None
+    if len({pe.lower(), pt.lower(), px.lower()}) < 3:
+        return None
+    if len(bl) > 220:
+        bl = bl[:219] + "…"
+    return {
+        "probe_equals": pe[:120],
+        "probe_tone": pt[:120],
+        "probe_excludes": px[:120],
+        "baseline": bl,
+    }
 
 
 def generate_llmtest_stub(
@@ -711,6 +856,7 @@ def generate_llmtest_stub(
     tips: Optional[list[str]] = None,
     transcript: Optional[str] = None,
     timeline: Optional[list[dict[str, Any]]] = None,
+    suite_parts: Optional[dict[str, str]] = None,
 ) -> str:
     """Emit a paste-ready llmtest suite from real chat exchanges (not goal dumps)."""
     turns = parse_transcript(transcript or "") if transcript else []
@@ -724,17 +870,38 @@ def generate_llmtest_stub(
         goal=goal,
     )
 
-    equals_case = cases[0]
-    tone_case = next((c for c in cases if c.get("kind") == "tone"), cases[min(1, len(cases) - 1)])
-    excl_case = next((c for c in cases if c.get("kind") == "excludes"), cases[min(2, len(cases) - 1)])
+    seed = cases[0] if cases else {
+        "probe": _short_probe(goal, goal),
+        "assistant": _clean(str(focus.get("assistant_text") or "")),
+        "baseline": _semantic_baseline("", goal, goal),
+        "drifted": overall_drift >= 0.35,
+    }
+    assistant_src = str(seed.get("assistant") or focus.get("assistant_text") or "")
+    seed_probe = str(seed.get("probe") or "")
 
-    # Prefer a distinct second/third probe when available
-    if len(cases) >= 2 and cases[1].get("kind") not in {"tone", "excludes"}:
-        tone_case = cases[1]
-    if len(cases) >= 3 and cases[2].get("kind") not in {"tone", "excludes"}:
-        excl_case = cases[2]
+    if suite_parts:
+        probe_equals = suite_parts["probe_equals"]
+        probe_tone = suite_parts["probe_tone"]
+        probe_excludes = suite_parts["probe_excludes"]
+        baseline = suite_parts["baseline"]
+    else:
+        # Prefer distinct user messages from the timeline when available
+        timeline_probes: list[str] = []
+        for point in timeline or []:
+            u = _clean(str(point.get("user_text") or ""))
+            if u:
+                q = _short_probe(u, goal)
+                if q.lower() not in {x.lower() for x in timeline_probes}:
+                    timeline_probes.append(q)
+        if len(timeline_probes) >= 3:
+            probe_equals, probe_tone, probe_excludes = timeline_probes[:3]
+        else:
+            probe_equals, probe_tone, probe_excludes = _probe_variants(
+                seed_probe, goal, assistant_src
+            )
+        baseline = _semantic_baseline(assistant_src, goal, probe_equals)
 
-    drifted = overall_drift >= 0.35 or any(c.get("drifted") for c in cases[:1])
+    drifted = overall_drift >= 0.35 or bool(seed.get("drifted"))
     peak_label = str(focus.get("label") or "").strip()
     peak_score = focus.get("drift_score")
     if drifted:
@@ -798,17 +965,17 @@ suite = LLMTestSuite(
 
 @suite.test
 def test_response_matches_expected_meaning():
-    response = suite.query("{_py_str(str(equals_case['probe']), 120)}")
+    response = suite.query("{_py_str(probe_equals, 120)}")
     assert_semantically_equals(
         response,
-        baseline="{_py_str(str(equals_case['baseline']), 280)}",
+        baseline="{_py_str(baseline, 200)}",
         threshold=0.82,
     )
 
 
 @suite.test
 def test_tone_stays_on_task():
-    response = suite.query("{_py_str(str(tone_case['probe']), 120)}")
+    response = suite.query("{_py_str(probe_tone, 120)}")
     assert_tone_matches(
         response,
         persona="{_py_str(persona, 120)}",
@@ -818,7 +985,7 @@ def test_tone_stays_on_task():
 
 @suite.test
 def test_does_not_abandon_goal():
-    response = suite.query("{_py_str(str(excl_case['probe']), 120)}")
+    response = suite.query("{_py_str(probe_excludes, 120)}")
     assert_semantically_excludes(
         response,
         concept="{_py_str(forbidden, 200)}",

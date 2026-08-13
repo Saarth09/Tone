@@ -676,10 +676,45 @@ async def chat_review(
 @app.post("/api/chat-review/generate-test", response_model=ChatReviewGenerateTestOut)
 async def chat_review_generate_test(
     body: ChatReviewGenerateTestIn,
+    session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
     """Turn a chat-review result into a paste-ready llmtest suite."""
-    _ = user
+    assert sampler is not None
+
+    focus = body.peak or body.first_alert
+    seed_probe = ""
+    assistant = ""
+    if focus:
+        seed_probe = (focus.user_text or "").strip()
+        assistant = (focus.assistant_text or "").strip()
+    if not assistant and body.timeline:
+        for p in body.timeline:
+            if (p.assistant_text or "").strip():
+                assistant = p.assistant_text.strip()
+                if not seed_probe:
+                    seed_probe = (p.user_text or "").strip()
+                break
+    if not seed_probe:
+        seed_probe = body.goal[:120]
+
+    suite_parts = None
+    await connections.load_user(session, user.id)
+    cfg = connections.live_for(user.id)
+    if cfg.api_key or settings.demo_mode:
+        sampler._bind_user_llm(user.id)
+
+        async def _complete(prompt: str):
+            return await sampler.llm.complete(prompt)
+
+        suite_parts = await chat_review_mod.maybe_llm_suite_parts(
+            llm_complete=_complete,
+            goal=body.goal,
+            seed_probe=seed_probe,
+            assistant=assistant,
+            overall_drift=body.overall_drift,
+        )
+
     code = chat_review_mod.generate_llmtest_stub(
         goal=body.goal,
         peak=body.peak.model_dump() if body.peak else None,
@@ -688,6 +723,7 @@ async def chat_review_generate_test(
         tips=body.tips,
         transcript=body.transcript,
         timeline=[p.model_dump() for p in body.timeline],
+        suite_parts=suite_parts,
     )
     return ChatReviewGenerateTestOut(code=code)
 
