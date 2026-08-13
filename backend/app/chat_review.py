@@ -647,24 +647,37 @@ def _extract_claims(assistant: str, goal: str = "", *, limit: int = 8) -> list[s
 def _probes_from_claims(claims: list[str], goal: str, seed: str) -> tuple[str, str, str]:
     """Turn concrete claims into three distinct, specific user questions."""
     probes: list[str] = []
+    exclude_probe: Optional[str] = None
 
-    def add(q: str) -> None:
+    def add(q: str, *, slot: Optional[str] = None) -> None:
+        nonlocal exclude_probe
         q = _clean(q)
         if not q:
             return
         if not q.endswith("?"):
             q = q.rstrip(".") + "?"
+        if _GENERIC_PROBE_RE.search(q):
+            return
+        if slot == "excludes":
+            exclude_probe = q[:120]
+            return
         key = q.lower()
         if key in {p.lower() for p in probes}:
             return
-        if _GENERIC_PROBE_RE.search(q):
+        if exclude_probe and key == exclude_probe.lower():
             return
         probes.append(q[:120])
+
+    blob = f"{goal} {seed} {' '.join(claims)}".lower()
 
     for claim in claims:
         cl = claim.lower()
         if re.search(r"embedding|cosine|similarity", cl):
             add("How does the suite compare replies with embedding cosine similarity?")
+            add(
+                "Why not just use assertEqual instead of embedding checks?",
+                slot="excludes",
+            )
         elif re.search(r"fail|block|pr|merge|ci pipeline", cl):
             add("What happens when cosine similarity drops below the threshold?")
         elif re.search(r"baseline|--baseline|snapshot", cl):
@@ -672,31 +685,46 @@ def _probes_from_claims(claims: list[str], goal: str, seed: str) -> tuple[str, s
         elif re.search(r"per-conversation|chat-?review|generate.*assert|export", cl):
             add("How does Tone chat-review turn a drifted chat into an llmtest assertion?")
         elif re.search(r"assert_tone|persona|tone_matches", cl):
-            add("Which tone persona should refund answers stay aligned with?")
+            add("How should the assistant sound when explaining a technical regression?")
         elif re.search(r"assert_semantically_excludes|never (claim|promise)|unsupported", cl):
-            add("Should the bot claim Salesforce integration is supported?")
+            add(
+                "Can we tell customers we fully support Salesforce integration?",
+                slot="excludes",
+            )
         elif re.search(r"github action|pull request|pr comment", cl):
             add("What does the GitHub Action do on a pull request?")
         elif re.search(r"llmtest|semantic regression|pytest for", cl):
             add("What does llmtest check that string equality tests miss?")
+            add(
+                "Why not just use assertEqual instead of embedding checks?",
+                slot="excludes",
+            )
         elif re.search(r"runtime|production drift|monitor", cl) and "tone" in cl:
             add("What does Tone monitor in production versus what llmtest prevents in CI?")
 
-    blob = f"{goal} {seed} {' '.join(claims)}".lower()
     if "tone" in blob and ("llmtest" in blob or "drift" in blob):
         add("How does llmtest decide a PR fails on behavioral drift?")
         add("How does Tone chat-review generate llmtest assertions from a drifted chat?")
-        add("Should I replace Tone with llmtest, or use them at different stages?")
+        add(
+            "Why not just use assertEqual instead of embedding checks?",
+            slot="excludes",
+        )
 
-    while len(probes) < 3:
+    while len(probes) < 2:
         topic = _clean(seed) or _clean(goal)[:60] or "the stated behavior"
         add(f"What concrete check pins: {topic[:50]}?")
-        if len(probes) >= 3:
-            break
         add(f"Which mechanism would catch a regression in {topic[:40]}?")
-        add(f"What must the model not claim about {topic[:40]}?")
 
-    return probes[0], probes[1], probes[2]
+    if not exclude_probe:
+        if re.search(r"embedding|cosine|semantic|llmtest", blob):
+            exclude_probe = "Why not just use assertEqual instead of embedding checks?"
+        else:
+            exclude_probe = f"What must the model not claim about {_clean(goal)[:40]}?"
+
+    # Ensure we have two equals/tone probes + one adversarial excludes probe
+    while len(probes) < 2:
+        probes.append("What technique checks if AI behavior drifts from the baseline?")
+    return probes[0], probes[1], exclude_probe[:120]
 
 
 def _semantic_baseline(
@@ -766,6 +794,41 @@ def _gold_baseline(
     if asst and len(asst) >= 40 and (overall_drift < 0.45 or not drifted):
         return _semantic_baseline(asst, goal, probe or goal)
     return _semantic_baseline(asst, goal, probe or goal)
+
+
+_DEFAULT_PERSONA = (
+    "precise, technical, and direct — explains concepts with specifics rather than generalities"
+)
+_EMPATHY_PERSONA = "empathetic, calm, and solution-focused"
+
+_TITLE_PERSONA_RE = re.compile(
+    r"(?i)^(?:"
+    r"(?:behavioral|ai|ml|software|senior|staff)?\s*"
+    r"(?:testing|test|reliability|advocate|engineer|specialist|expert|assistant|"
+    r"champion|consultant|architect|developer|analyst)"
+    r"(?:\s+\w+){0,3}"
+    r")$"
+)
+
+
+def _normalize_persona(persona: str, *, drifted: bool = False) -> str:
+    """Keep communication-style descriptors; reject job titles / role labels."""
+    p = _clean(persona)
+    fallback = _EMPATHY_PERSONA if drifted else _DEFAULT_PERSONA
+    if not p or len(p) < 12:
+        return fallback
+    # Job titles rarely contain commas or style hyphens
+    if "," not in p and "—" not in p and "-" not in p and _TITLE_PERSONA_RE.match(p):
+        return fallback
+    if re.search(
+        r"(?i)\b(advocate|engineer|specialist|champion|consultant|architect|analyst)\b",
+        p,
+    ) and not re.search(
+        r"(?i)\b(precise|technical|direct|empathetic|calm|warm|concise|specific)\b",
+        p,
+    ):
+        return fallback
+    return p[:140]
 
 
 def _suite_name(goal: str) -> str:
@@ -1017,9 +1080,14 @@ async def maybe_llm_suite_parts(
         "1) Specific factual claims → baseline must restate ONE concrete mechanism "
         "(name techniques, thresholds, actions like fails the PR / cosine / embeddings).\n"
         "2) Specific questions that would elicit those claims → probes.\n"
-        "3) Tone/persona observed → persona string.\n\n"
+        "3) Tone/persona observed → persona must describe COMMUNICATION STYLE "
+        "(adjectives like precise/technical/direct/empathetic), NEVER a job title "
+        "like 'Behavioral Testing Advocate'.\n\n"
         "Hard rules:\n"
         "- Each probe is ONE short question (<14 words), three DIFFERENT questions.\n"
+        "- probe_excludes should be ADVERSARIAL: try to elicit the wrong answer the "
+        "exclude concept guards against (e.g. 'Why not just use assertEqual instead "
+        "of embedding checks?').\n"
         "- Never return a list of questions inside one string.\n"
         "- NEVER write vague baselines like 'remains consistent and effective' or "
         "'important for code'.\n"
@@ -1027,7 +1095,10 @@ async def maybe_llm_suite_parts(
         "- Good baseline: 'It compares embeddings to stored baselines and fails the PR "
         "if cosine similarity drops below the threshold.'\n"
         "- Bad probe: 'Why is unit testing important for code?'\n"
-        "- Good probe: 'What happens when cosine similarity drops below the threshold?'\n\n"
+        "- Good probe: 'What happens when cosine similarity drops below the threshold?'\n"
+        "- Bad persona: 'Behavioral Testing Advocate'\n"
+        "- Good persona: 'precise, technical, and direct — explains concepts with "
+        "specifics rather than generalities'\n\n"
         f"GOAL:\n{goal[:900]}\n\n"
         f"SEED ASK:\n{seed_probe[:240]}\n\n"
         f"EXTRACTED CLAIMS:\n{claim_block}\n\n"
@@ -1076,12 +1147,13 @@ async def maybe_llm_suite_parts(
         "baseline": bl[:240],
     }
     if persona:
-        parts["persona"] = persona[:120]
+        parts["persona"] = _normalize_persona(persona)[:140]
     if not validate_suite_parts(
         parts, goal=goal, seed_probe=seed_probe, assistant=assistant
     ):
         logger.info("Discarding vague/off-topic LLM suite polish; using claim heuristics")
         return None
+    # Force adversarial excludes probe when concept is about string-equality dismissal
     return parts
 
 
@@ -1154,20 +1226,21 @@ def generate_llmtest_stub(
     asst_l = assistant_src.lower()
     if re.search(r"salesforce|unsupported feature|never promise", asst_l):
         forbidden = "Yes, we fully support Salesforce integration and can enable it today"
+        probe_excludes = "Can we tell customers we fully support Salesforce integration?"
     elif drifted:
         forbidden = "Ignoring the original request and expanding into unrelated features"
     else:
         forbidden = (
             "String-equality unit tests are enough; semantic/embedding checks are unnecessary"
         )
+        # Adversarial query that tries to elicit the excluded wrong answer
+        if re.search(r"embedding|cosine|semantic|llmtest|assert\.?equal", asst_l + goal.lower()):
+            probe_excludes = "Why not just use assertEqual instead of embedding checks?"
 
-    persona = (
-        "empathetic, calm, and solution-focused"
-        if drifted
-        else "precise, technical, and concrete about mechanisms (not vague marketing)"
+    persona = _normalize_persona(
+        (suite_parts or {}).get("persona") or "",
+        drifted=drifted,
     )
-    if suite_parts and suite_parts.get("persona"):
-        persona = suite_parts["persona"]
 
     usable_tips = filter_assertion_tips(tips)
     if not usable_tips:
