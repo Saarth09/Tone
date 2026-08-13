@@ -281,7 +281,9 @@ _BAD_TIP_RE = re.compile(
     r"(?i)\b("
     r"benefits of using ai|risks of using ai|casual summary|solicit feedback|"
     r"clarify your focus|key benefits|reinforce the value|marketing|"
-    r"explain it like i'?m five|how this works simply|core functionality as described"
+    r"explain it like i'?m five|how this works simply|core functionality as described|"
+    r"responds? directly to user queries|maintain user trust|what tone should the ai use|"
+    r"what should it not include|can you explain how this works"
     r")\b"
 )
 
@@ -533,7 +535,7 @@ def _polish_probe(probe: str, *, max_len: int = 100) -> str:
 
 
 def _strip_md(text: str) -> str:
-    text = re.sub(r"[*_`#]+", " ", text or "")
+    text = re.sub(r"\*\*|__|`+|#+", " ", text or "")
     text = re.sub(r"^\s*[-•]\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     return _clean(text)
@@ -547,86 +549,208 @@ def _first_sentences(text: str, *, n: int = 2, max_len: int = 280) -> str:
     return joined
 
 
+_MECHANISM_RE = re.compile(
+    r"(?i)\b("
+    r"embedding|cosine|threshold|baseline|assert_[a-z_]+|github action|"
+    r"semantic(?:ally)?|snapshot|sentence-transformers|per-conversation|"
+    r"feedback loop|system prompt|fails? the (?:pr|merge|ci)|blocks? the merge|"
+    r"chat-?review|llmtest|mmd|kl divergence"
+    r")\b"
+)
+
+_GENERIC_BASELINE_RE = re.compile(
+    r"(?i)\b("
+    r"consistent and effective|remains consistent|important for (?:code|testing)|"
+    r"ensure[s]? ai behavior|maintain(?:s|ing)? (?:focus|user trust)|"
+    r"responds? directly|avoid ambiguity|stays? on (?:track|task)|"
+    r"helpful and accurate|high[- ]quality (?:answers|responses)"
+    r")\b"
+)
+
+_GENERIC_PROBE_RE = re.compile(
+    r"(?i)^(?:"
+    r"why is unit testing important|"
+    r"how does this (?:work|plugin work)|"
+    r"what tone should|"
+    r"can you explain how this works|"
+    r"what should it not include|"
+    r"what is the purpose of this plugin|"
+    r"how can i improve"
+    r")"
+)
+
+_CLAIM_SKIP_RE = re.compile(
+    r"(?i)^(you've now got|here(?:'s| is) the|full (?:breakdown|architecture)|"
+    r"the core idea|what you build|no undergrad|the one-liner|my honest ranking)"
+)
+
+
+def _extract_claims(assistant: str, goal: str = "", *, limit: int = 8) -> list[str]:
+    """Pull concrete factual/mechanism claims from the assistant reply."""
+    asst = _strip_md(assistant)
+    claims: list[str] = []
+
+    for line in (assistant or "").splitlines():
+        m = re.match(
+            r"(?i)^\s*([A-Za-z][A-Za-z0-9 ./-]{2,40}?)\s*=\s*(.+?)\s*$",
+            line.strip(),
+        )
+        if not m:
+            continue
+        left = _clean(m.group(1))
+        right = _clean(_strip_md(m.group(2)))
+        if left and right and len(right) >= 12 and " = " not in right:
+            claims.append(f"{left} is {right}")
+
+    for raw in re.split(r"(?<=[.!?])\s+", asst):
+        s = _clean(raw)
+        if len(s) < 45 or len(s) > 240:
+            continue
+        if _CLAIM_SKIP_RE.match(s):
+            continue
+        # Skip mashed multi-definition blobs
+        if s.lower().count(" is ") >= 2 and " = " in (assistant or ""):
+            continue
+        if _MECHANISM_RE.search(s) or re.search(
+            r"(?i)\b(runs?|checks?|compares?|stores?|embeds?|fails?|blocks?|"
+            r"generates?|exports?|thresholds?)\b",
+            s,
+        ):
+            claims.append(s)
+
+    def score(c: str) -> tuple[int, int, int, int]:
+        cl = c.lower()
+        # Prefer action/mechanism sentences over label definitions
+        action = 0 if re.search(r"(?i)\b(fails?|blocks?|compares?|stores?|embeds?|drops? below)\b", cl) else 1
+        mech = 0 if _MECHANISM_RE.search(c) else 1
+        mash = 0 if c.lower().count(" is ") <= 1 else 1
+        return (action, mech, mash, -min(len(c), 180))
+
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for c in sorted(set(claims), key=score):
+        key = c.lower()[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(c)
+        if len(dedup) >= limit:
+            break
+
+    if not dedup and goal:
+        g = _clean(goal)
+        if len(g) >= 40:
+            dedup.append(g[:180] + ("…" if len(g) > 180 else ""))
+    return dedup
+
+
+def _probes_from_claims(claims: list[str], goal: str, seed: str) -> tuple[str, str, str]:
+    """Turn concrete claims into three distinct, specific user questions."""
+    probes: list[str] = []
+
+    def add(q: str) -> None:
+        q = _clean(q)
+        if not q:
+            return
+        if not q.endswith("?"):
+            q = q.rstrip(".") + "?"
+        key = q.lower()
+        if key in {p.lower() for p in probes}:
+            return
+        if _GENERIC_PROBE_RE.search(q):
+            return
+        probes.append(q[:120])
+
+    for claim in claims:
+        cl = claim.lower()
+        if re.search(r"embedding|cosine|similarity", cl):
+            add("How does the suite compare replies with embedding cosine similarity?")
+        elif re.search(r"fail|block|pr|merge|ci pipeline", cl):
+            add("What happens when cosine similarity drops below the threshold?")
+        elif re.search(r"baseline|--baseline|snapshot", cl):
+            add("What does llmtest store when you run --baseline?")
+        elif re.search(r"per-conversation|chat-?review|generate.*assert|export", cl):
+            add("How does Tone chat-review turn a drifted chat into an llmtest assertion?")
+        elif re.search(r"assert_tone|persona|tone_matches", cl):
+            add("Which tone persona should refund answers stay aligned with?")
+        elif re.search(r"assert_semantically_excludes|never (claim|promise)|unsupported", cl):
+            add("Should the bot claim Salesforce integration is supported?")
+        elif re.search(r"github action|pull request|pr comment", cl):
+            add("What does the GitHub Action do on a pull request?")
+        elif re.search(r"llmtest|semantic regression|pytest for", cl):
+            add("What does llmtest check that string equality tests miss?")
+        elif re.search(r"runtime|production drift|monitor", cl) and "tone" in cl:
+            add("What does Tone monitor in production versus what llmtest prevents in CI?")
+
+    blob = f"{goal} {seed} {' '.join(claims)}".lower()
+    if "tone" in blob and ("llmtest" in blob or "drift" in blob):
+        add("How does llmtest decide a PR fails on behavioral drift?")
+        add("How does Tone chat-review generate llmtest assertions from a drifted chat?")
+        add("Should I replace Tone with llmtest, or use them at different stages?")
+
+    while len(probes) < 3:
+        topic = _clean(seed) or _clean(goal)[:60] or "the stated behavior"
+        add(f"What concrete check pins: {topic[:50]}?")
+        if len(probes) >= 3:
+            break
+        add(f"Which mechanism would catch a regression in {topic[:40]}?")
+        add(f"What must the model not claim about {topic[:40]}?")
+
+    return probes[0], probes[1], probes[2]
+
+
 def _semantic_baseline(
     assistant: str,
     goal: str,
     probe: str,
     *,
-    max_len: int = 180,
+    max_len: int = 200,
 ) -> str:
     """
-    Short gold answer for assert_semantically_equals — meaning, not a truncated chat dump.
+    Short gold answer pinned to a concrete claim from the chat — not a vague theme.
     """
-    asst = _strip_md(assistant)
-    g = _clean(goal)
-    p = _clean(probe)
+    claims = _extract_claims(assistant, goal)
+    for claim in claims:
+        if _GENERIC_BASELINE_RE.search(claim):
+            continue
+        if claim.lower().count(" is ") >= 2:
+            continue
+        if _MECHANISM_RE.search(claim) or re.search(
+            r"(?i)\b(fails?|blocks?|compares?|stores?|embeds?|drops? below)\b",
+            claim,
+        ):
+            return claim if len(claim) <= max_len else claim[: max_len - 1] + "…"
 
-    # Domain-aware compression when the chat is about Tone ↔ llmtest
-    blob = f"{asst} {g} {p}".lower()
-    if "tone" in blob and ("llmtest" in blob or "behavioral" in blob or "ci" in blob):
-        if "per-conversation" in blob or "chat-review" in blob or "chat review" in blob:
-            return (
-                "Tone's per-conversation drift detection can automatically generate "
-                "llmtest assertions, creating a feedback loop where production drift "
-                "becomes CI prevention."
-            )[:max_len]
+    asst = _strip_md(assistant)
+    blob = f"{asst} {goal} {probe}".lower()
+    if "embedding" in blob and ("cosine" in blob or "similarity" in blob or "threshold" in blob):
         return (
-            "Use llmtest to prevent drift before deploy, Tone to detect it in production, "
-            "and chat review to diagnose individual sessions."
+            "It runs embedding similarity checks against stored baseline responses "
+            "and fails the PR if cosine similarity drops below the configured threshold."
+        )[:max_len]
+    if "tone" in blob and ("llmtest" in blob or "chat-review" in blob or "chat review" in blob):
+        return (
+            "Tone's per-conversation drift detection can automatically generate llmtest "
+            "assertions, so production drift becomes a CI check that blocks regressions."
+        )[:max_len]
+    if "baseline" in blob and ("llmtest" in blob or "snapshot" in blob):
+        return (
+            "llmtest --baseline stores raw responses and embeddings under .llmtest/baseline/ "
+            "so later CI runs compare against that checkpoint."
         )[:max_len]
 
-    if asst and len(asst) >= 40:
-        # Prefer a single clean sentence that isn't list/teaser scaffolding
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", asst) if s.strip()]
-        skip = re.compile(
-            r"(?i)^(you've now got|here(?:'s| is) the|full (?:breakdown|architecture)|"
-            r"the core idea|what you build)"
-        )
-        for s in sentences:
-            s = _clean(s)
-            if skip.match(s):
-                continue
-            if 50 <= len(s) <= max_len:
-                return s
-            if len(s) > max_len:
-                return s[: max_len - 1] + "…"
-        compact = _first_sentences(asst, n=1, max_len=max_len)
-        if compact and not skip.match(compact):
-            return compact
+    for claim in claims:
+        if claim.lower().count(" is ") <= 1 and not _GENERIC_BASELINE_RE.search(claim):
+            return claim if len(claim) <= max_len else claim[: max_len - 1] + "…"
 
-    topic = p if 20 <= len(p) <= 90 else (g[:90] if g else "the user's request")
-    return f"Answer clearly and stay on scope: {topic}"[:max_len]
+    topic = _clean(probe) if 20 <= len(_clean(probe)) <= 90 else _clean(goal)[:90]
+    return f"State the concrete mechanism for: {topic}"[:max_len]
 
 
 def _probe_variants(seed: str, goal: str, assistant: str = "") -> tuple[str, str, str]:
-    """Three independent user asks that probe the same intended behavior from different angles."""
-    seed = _clean(seed)
-    blob = f"{seed} {goal} {assistant}".lower()
-
-    if "tone" in blob and ("llmtest" in blob or "drift" in blob or "ci" in blob):
-        return (
-            "How does Tone chat-review feed into llmtest?",
-            "What's the connection between drift detection and CI testing?",
-            "Should I use Tone alongside llmtest or instead of it?",
-        )
-
-    # Generic: rephrase the seed three ways
-    topic = seed.rstrip("?") if seed else _clean(goal)[:80]
-    if not topic:
-        topic = "the original task"
-    equals = topic if topic.endswith("?") else f"How should you handle this: {topic[:70]}?"
-    tone = f"Explain {topic[:60].rstrip('?')} briefly and helpfully."
-    excludes = f"Can you stay on '{topic[:50].rstrip('?')}' without changing the goal?"
-    # Deduplicate if they collapsed
-    seen: set[str] = set()
-    out: list[str] = []
-    for q in (equals, tone, excludes):
-        key = q.lower()
-        if key in seen:
-            q = f"{q} (be specific)"
-        seen.add(q.lower())
-        out.append(q[:120])
-    return out[0], out[1], out[2]
+    """Three independent, claim-specific user asks — not generic theme questions."""
+    claims = _extract_claims(assistant, goal)
+    return _probes_from_claims(claims, goal, seed)
 
 
 def _gold_baseline(
@@ -641,7 +765,7 @@ def _gold_baseline(
     asst = _clean(assistant)
     if asst and len(asst) >= 40 and (overall_drift < 0.45 or not drifted):
         return _semantic_baseline(asst, goal, probe or goal)
-    return _semantic_baseline("", goal, probe or goal)
+    return _semantic_baseline(asst, goal, probe or goal)
 
 
 def _suite_name(goal: str) -> str:
@@ -830,7 +954,7 @@ def _probe_looks_valid(probe: str, topic: set[str]) -> bool:
         return False
     if "," in p and p.count("?") >= 2:
         return False
-    if _OFFTOPIC_PROBE_RE.search(p):
+    if _OFFTOPIC_PROBE_RE.search(p) or _GENERIC_PROBE_RE.search(p):
         return False
     if len(p.split()) > 18:
         return False
@@ -848,7 +972,7 @@ def validate_suite_parts(
     seed_probe: str,
     assistant: str,
 ) -> bool:
-    """Reject LLM polish that wandered off-topic or returned list junk."""
+    """Reject LLM polish that is off-topic, list-shaped, or too vague to catch regressions."""
     topic = _topic_tokens(goal, seed_probe, assistant)
     probes = [parts.get("probe_equals", ""), parts.get("probe_tone", ""), parts.get("probe_excludes", "")]
     if len({_clean(p).lower() for p in probes}) < 3:
@@ -857,11 +981,16 @@ def validate_suite_parts(
         if not _probe_looks_valid(p, topic):
             return False
     bl = _clean(parts.get("baseline") or "")
-    if len(bl) < 20 or len(bl) > 220:
+    if len(bl) < 40 or len(bl) > 240:
         return False
-    if bl.startswith("[") or _OFFTOPIC_PROBE_RE.search(bl):
+    if bl.startswith("[") or _OFFTOPIC_PROBE_RE.search(bl) or _GENERIC_BASELINE_RE.search(bl):
         return False
-    if topic and _token_overlap(_topic_tokens(bl), topic) < 1:
+    # Must pin a concrete mechanism OR overlap strongly with assistant claims
+    asst_topic = _topic_tokens(assistant)
+    if not _MECHANISM_RE.search(bl):
+        if _token_overlap(_topic_tokens(bl), asst_topic or topic) < 2:
+            return False
+    elif topic and _token_overlap(_topic_tokens(bl), topic) < 1:
         return False
     return True
 
@@ -874,21 +1003,35 @@ async def maybe_llm_suite_parts(
     assistant: str,
     overall_drift: float,
 ) -> Optional[dict[str, str]]:
-    """Ask the connected LLM for 3 distinct probes + a short semantic baseline."""
+    """Ask the connected LLM for claim-specific probes + a concrete baseline."""
     if llm_complete is None:
         return None
+    claims = _extract_claims(assistant, goal)
+    claim_block = "\n".join(f"- {c}" for c in claims[:5]) or "(none extracted)"
     prompt = (
-        "Create llmtest suite materials about the GOAL below. Return ONLY JSON:\n"
-        '{"probe_equals":"...","probe_tone":"...","probe_excludes":"...","baseline":"..."}\n'
+        "Create llmtest materials that catch SPECIFIC behavioral regressions.\n"
+        "Return ONLY JSON:\n"
+        '{"probe_equals":"...","probe_tone":"...","probe_excludes":"...","baseline":"...",'
+        '"persona":"..."}\n\n'
+        "Extract from ASSISTANT NOTES / CLAIMS:\n"
+        "1) Specific factual claims → baseline must restate ONE concrete mechanism "
+        "(name techniques, thresholds, actions like fails the PR / cosine / embeddings).\n"
+        "2) Specific questions that would elicit those claims → probes.\n"
+        "3) Tone/persona observed → persona string.\n\n"
         "Hard rules:\n"
-        "- Each probe is ONE short question (<12 words) about the GOAL topic.\n"
-        "- Probes must be three DIFFERENT questions; never a JSON/Python list of questions.\n"
-        "- Never invent unrelated topics (jokes, weather, writing tips, meals, etc.).\n"
-        "- baseline: one sentence (<=25 words) paraphrasing the intended meaning from the notes.\n"
-        "- Stay on-topic with GOAL / SEED ASK / ASSISTANT NOTES.\n\n"
+        "- Each probe is ONE short question (<14 words), three DIFFERENT questions.\n"
+        "- Never return a list of questions inside one string.\n"
+        "- NEVER write vague baselines like 'remains consistent and effective' or "
+        "'important for code'.\n"
+        "- Bad baseline: 'The plugin ensures AI behavior remains consistent.'\n"
+        "- Good baseline: 'It compares embeddings to stored baselines and fails the PR "
+        "if cosine similarity drops below the threshold.'\n"
+        "- Bad probe: 'Why is unit testing important for code?'\n"
+        "- Good probe: 'What happens when cosine similarity drops below the threshold?'\n\n"
         f"GOAL:\n{goal[:900]}\n\n"
         f"SEED ASK:\n{seed_probe[:240]}\n\n"
-        f"ASSISTANT NOTES TO PARAPHRASE (do not copy):\n{assistant[:900]}\n\n"
+        f"EXTRACTED CLAIMS:\n{claim_block}\n\n"
+        f"ASSISTANT NOTES:\n{assistant[:1200]}\n\n"
         f"OVERALL DRIFT: {overall_drift:.2f}\n\n"
         "JSON:"
     )
@@ -915,7 +1058,6 @@ async def maybe_llm_suite_parts(
         return None
 
     def _one_probe(val: Any) -> str:
-        # Model sometimes returns a list of questions — reject that shape.
         if isinstance(val, list):
             return ""
         return _clean(str(val or ""))
@@ -924,18 +1066,21 @@ async def maybe_llm_suite_parts(
     pt = _one_probe(data.get("probe_tone"))
     px = _one_probe(data.get("probe_excludes"))
     bl = _clean(str(data.get("baseline") or ""))
+    persona = _clean(str(data.get("persona") or ""))
     if not (pe and pt and px and bl):
         return None
     parts = {
         "probe_equals": pe[:120],
         "probe_tone": pt[:120],
         "probe_excludes": px[:120],
-        "baseline": bl[:220],
+        "baseline": bl[:240],
     }
+    if persona:
+        parts["persona"] = persona[:120]
     if not validate_suite_parts(
         parts, goal=goal, seed_probe=seed_probe, assistant=assistant
     ):
-        logger.info("Discarding off-topic LLM suite polish; using heuristics")
+        logger.info("Discarding vague/off-topic LLM suite polish; using claim heuristics")
         return None
     return parts
 
@@ -986,20 +1131,10 @@ def generate_llmtest_stub(
         probe_excludes = suite_parts["probe_excludes"]
         baseline = suite_parts["baseline"]
     else:
-        # Prefer distinct user messages from the timeline when available
-        timeline_probes: list[str] = []
-        for point in timeline or []:
-            u = _clean(str(point.get("user_text") or ""))
-            if u:
-                q = _short_probe(u, goal)
-                if q.lower() not in {x.lower() for x in timeline_probes}:
-                    timeline_probes.append(q)
-        if len(timeline_probes) >= 3:
-            probe_equals, probe_tone, probe_excludes = timeline_probes[:3]
-        else:
-            probe_equals, probe_tone, probe_excludes = _probe_variants(
-                seed_probe, goal, assistant_src
-            )
+        # Prefer claim-derived probes (timeline user text is often a long brief)
+        probe_equals, probe_tone, probe_excludes = _probe_variants(
+            seed_probe, goal, assistant_src
+        )
         baseline = _semantic_baseline(assistant_src, goal, probe_equals)
 
     drifted = overall_drift >= 0.35 or bool(seed.get("drifted"))
@@ -1016,16 +1151,23 @@ def generate_llmtest_stub(
     else:
         header = "# Low goal drift — pinning observed on-track behavior so regressions fail CI."
 
-    forbidden = (
-        "Ignoring the original request and expanding into unrelated features"
-        if drifted
-        else "I cannot help with that / refusing to answer the user's request"
-    )
+    asst_l = assistant_src.lower()
+    if re.search(r"salesforce|unsupported feature|never promise", asst_l):
+        forbidden = "Yes, we fully support Salesforce integration and can enable it today"
+    elif drifted:
+        forbidden = "Ignoring the original request and expanding into unrelated features"
+    else:
+        forbidden = (
+            "String-equality unit tests are enough; semantic/embedding checks are unnecessary"
+        )
+
     persona = (
         "empathetic, calm, and solution-focused"
         if drifted
-        else "helpful, focused, and faithful to the user's stated requirements"
+        else "precise, technical, and concrete about mechanisms (not vague marketing)"
     )
+    if suite_parts and suite_parts.get("persona"):
+        persona = suite_parts["persona"]
 
     usable_tips = filter_assertion_tips(tips)
     if not usable_tips:
